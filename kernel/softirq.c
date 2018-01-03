@@ -26,6 +26,7 @@
 #include <linux/smpboot.h>
 #include <linux/tick.h>
 
+#include "mt_sched_mon.h"
 #define CREATE_TRACE_POINTS
 #include <trace/events/irq.h>
 
@@ -114,8 +115,13 @@ static void __local_bh_disable(unsigned long ip, unsigned int cnt)
 		trace_softirqs_off(ip);
 	raw_local_irq_restore(flags);
 
-	if (preempt_count() == cnt)
+	if (preempt_count() == cnt) {
 		trace_preempt_off(CALLER_ADDR0, get_parent_ip(CALLER_ADDR1));
+#ifdef CONFIG_MTPROF
+		MT_trace_preempt_off();
+#endif
+	}
+
 }
 #else /* !CONFIG_TRACE_IRQFLAGS */
 static inline void __local_bh_disable(unsigned long ip, unsigned int cnt)
@@ -250,7 +256,9 @@ restart:
 			kstat_incr_softirqs_this_cpu(vec_nr);
 
 			trace_softirq_entry(vec_nr);
-			h->action(h);
+            mt_trace_SoftIRQ_start(vec_nr);
+            h->action(h);
+            mt_trace_SoftIRQ_end(vec_nr);
 			trace_softirq_exit(vec_nr);
 			if (unlikely(prev_count != preempt_count())) {
 				printk(KERN_ERR "huh, entered softirq %u %s %p"
@@ -330,10 +338,19 @@ void irq_enter(void)
 
 static inline void invoke_softirq(void)
 {
-	if (!force_irqthreads)
-		__do_softirq();
-	else
+	if (!force_irqthreads) {
+		/*
+		 * We can safely execute softirq on the current stack if
+		 * it is the irq stack, because it should be near empty
+		 * at this stage. But we have no way to know if the arch
+		 * calls irq_exit() on the irq stack. So call softirq
+		 * in its own stack to prevent from any overrun on top
+		 * of a potentially deep task stack.
+		 */
+		do_softirq();
+	} else {
 		wakeup_softirqd();
+	}
 }
 
 static inline void tick_irq_exit(void)
@@ -480,7 +497,9 @@ static void tasklet_action(struct softirq_action *a)
 			if (!atomic_read(&t->count)) {
 				if (!test_and_clear_bit(TASKLET_STATE_SCHED, &t->state))
 					BUG();
+                mt_trace_tasklet_start(t->func);
 				t->func(t->data);
+                mt_trace_tasklet_end(t->func);
 				tasklet_unlock(t);
 				continue;
 			}

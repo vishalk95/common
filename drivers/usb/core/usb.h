@@ -55,7 +55,7 @@ extern int usb_match_one_id_intf(struct usb_device *dev,
 extern int usb_match_device(struct usb_device *dev,
 			    const struct usb_device_id *id);
 extern void usb_forced_unbind_intf(struct usb_interface *intf);
-extern void usb_rebind_intf(struct usb_interface *intf);
+extern void usb_unbind_and_rebind_marked_interfaces(struct usb_device *udev);
 
 extern int usb_hub_claim_port(struct usb_device *hdev, unsigned port,
 		struct dev_state *owner);
@@ -120,6 +120,10 @@ static inline int usb_set_usb2_hardware_lpm(struct usb_device *udev, int enable)
 {
 	return 0;
 }
+#endif
+
+#ifdef CONFIG_USB_MTK_OTG
+extern void usb_hnp_polling_work(struct work_struct *work);
 #endif
 
 extern struct bus_type usb_bus_type;
@@ -194,4 +198,27 @@ extern acpi_handle usb_get_hub_port_acpi_handle(struct usb_device *hdev,
 #else
 static inline int usb_acpi_register(void) { return 0; };
 static inline void usb_acpi_unregister(void) { };
+#endif
+
+enum my_print_levels {
+	MY_PRINT_DBG = 0 ,
+	MY_PRINT_INFO = 1 ,
+	MY_PRINT_WARN = 2 ,
+	MY_PRINT_ERR = 3 ,
+} ;
+
+/* set cur accepted log level here */
+#define my_print_level (MY_PRINT_DBG)
+
+#define my_print_level_avail(level) (level >= my_print_level ? 1:0)
+
+#define MYDBG(fmt, args...) do {if(my_print_level_avail(MY_PRINT_DBG)){pr_warning("MTK_ICUSB [DBG], <%s(), %d> " fmt, __func__, __LINE__, ## args); }}while(0)
+#define MYINFO(fmt, args...) do {if(my_print_level_avail(MY_PRINT_INFO)){pr_warning("MTK_ICUSB [INFO], <%s(), %d> " fmt, __func__, __LINE__, ## args); }}while(0)
+#define MYWARN(fmt, args...) do {if(my_print_level_avail(MY_PRINT_WARN)){pr_warning("MTK_ICUSB [WARN], <%s(), %d> " fmt, __func__, __LINE__, ## args); }}while(0)
+#define MYERR(fmt, args...) do {if(my_print_level_avail(MY_PRINT_ERR)){pr_warning("MTK_ICUSB [ERR], <%s(), %d> " fmt, __func__, __LINE__, ## args); }}while(0)
+
+#ifdef CONFIG_MTK_DT_USB_SUPPORT
+#ifdef	CONFIG_PM_RUNTIME
+#define USB_WAKE_TIME 5	
+#endif
 #endif

@@ -71,19 +71,39 @@ static inline void ipi_flush_bp_all(void *ignored)
 }
 
 #ifdef CONFIG_ARM_ERRATA_798181
-static int erratum_a15_798181(void)
+bool (*erratum_a15_798181_handler)(void);
+
+static bool erratum_a15_798181_partial(void)
+{
+	asm("mcr p15, 0, %0, c8, c3, 1" : : "r" (0));
+	dsb();
+	return false;
+}
+
+static bool erratum_a15_798181_broadcast(void)
+{
+	asm("mcr p15, 0, %0, c8, c3, 1" : : "r" (0));
+	dsb();
+	return true;
+}
+
+void erratum_a15_798181_init(void)
 {
 	unsigned int midr = read_cpuid_id();
+	unsigned int revidr = read_cpuid(CPUID_REVIDR);
 
-	/* Cortex-A15 r0p0..r3p2 affected */
-	if ((midr & 0xff0ffff0) != 0x410fc0f0 || midr > 0x413fc0f2)
-		return 0;
-	return 1;
-}
-#else
-static int erratum_a15_798181(void)
-{
-	return 0;
+	if (erratum_a15_798181_handler == erratum_a15_798181_broadcast)
+		return;
+
+	/* Cortex-A15 r0p0..r3p2 w/o ECO fix affected */
+	if ((midr & 0xff0ffff0) != 0x410fc0f0 || midr > 0x413fc0f2 ||
+	    (revidr & 0x210) == 0x210) {
+		return;
+	}
+	if (revidr & 0x10)
+		erratum_a15_798181_handler = erratum_a15_798181_partial;
+	else
+		erratum_a15_798181_handler = erratum_a15_798181_broadcast;
 }
 #endif
 
@@ -97,35 +117,19 @@ static void broadcast_tlb_a15_erratum(void)
 	if (!erratum_a15_798181())
 		return;
 
-	dummy_flush_tlb_a15_erratum();
 	smp_call_function(ipi_flush_tlb_a15_erratum, NULL, 1);
 }
 
 static void broadcast_tlb_mm_a15_erratum(struct mm_struct *mm)
 {
-	int cpu, this_cpu;
+	int this_cpu;
 	cpumask_t mask = { CPU_BITS_NONE };
 
 	if (!erratum_a15_798181())
 		return;
 
-	dummy_flush_tlb_a15_erratum();
 	this_cpu = get_cpu();
-	for_each_online_cpu(cpu) {
-		if (cpu == this_cpu)
-			continue;
-		/*
-		 * We only need to send an IPI if the other CPUs are running
-		 * the same ASID as the one being invalidated. There is no
-		 * need for locking around the active_asids check since the
-		 * switch_mm() function has at least one dmb() (as required by
-		 * this workaround) in case a context switch happens on
-		 * another CPU after the condition below.
-		 */
-		if (atomic64_read(&mm->context.id) ==
-		    atomic64_read(&per_cpu(active_asids, cpu)))
-			cpumask_set_cpu(cpu, &mask);
-	}
+	a15_erratum_get_cpumask(this_cpu, mm, &mask);
 	smp_call_function_many(&mask, ipi_flush_tlb_a15_erratum, NULL, 1);
 	put_cpu();
 }

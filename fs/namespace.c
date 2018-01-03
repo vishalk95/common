@@ -21,6 +21,10 @@
 #include <linux/fs_struct.h>	/* get_fs_root et.al. */
 #include <linux/fsnotify.h>	/* fsnotify_vfsmount_delete */
 #include <linux/uaccess.h>
+//#define UMOUNT_LOG  //enable kernel layer unmount log when unmount fail
+#ifdef UMOUNT_LOG
+#include <linux/types.h>
+#endif
 #include <linux/proc_ns.h>
 #include <linux/magic.h>
 #include "pnode.h"
@@ -132,10 +136,130 @@ void mnt_release_group_id(struct mount *mnt)
 /*
  * vfsmount lock must be held for read
  */
+#ifdef UMOUNT_LOG
+#define UMOUNT_Partition "/emmc@usrdata"
+struct  record_ref_count{ 
+  pid_t pid;
+  char name[TASK_COMM_LEN];
+  int count;
+  struct record_ref_count *next;
+};
+
+struct record_ref_count *ref_head    = NULL;
+struct record_ref_count *ref_current = NULL;
+struct record_ref_count *ref_prev    = NULL;
+int s_total_count = 0;
+#endif
 static inline void mnt_add_count(struct mount *mnt, int n)
 {
+#ifdef UMOUNT_LOG
+int print_link_list=0;
+#ifndef CONFIG_SMP
+	preempt_disable();
+#endif
+
+		if (strcmp(UMOUNT_Partition,mnt->mnt_devname)==0)
+			{
+				//if (strcmp("mobile_log_d",current->comm)!=0) 
+					{
+					//if (current->pid < 100)	//((current->pid < 70) && (current->pid > 60))	
+					{
+						//printk("Ahsin n=%d  current->pid=%d name=%s \n",n,current->pid,current->comm);
+						spin_lock(&mnt_id_lock);
+						if (ref_head == NULL) //linked list head (start)
+						{
+							printk("Ahsin link list init mnt_get_count=%d \n",mnt_get_count(mnt));
+							
+							ref_current = kmalloc(sizeof(struct record_ref_count), GFP_KERNEL);
+		     				if (ref_current == NULL)
+							    printk("Ahsin can't allocate memory for ref_current /n");
+
+			 				ref_current->next = NULL;
+							ref_current->pid = current->pid;
+							strncpy(ref_current->name, current->comm, TASK_COMM_LEN -1);					
+							ref_current->name[TASK_COMM_LEN -1] = '\0';
+							ref_current->count = n;
+							s_total_count = s_total_count + n;
+							ref_head = ref_current;
+							
+							printk("Ahsin ref_head == NULL pid=%d name=%s counter=%d n=%d \n",ref_current->pid,ref_current->name,ref_current->count,n);
+						}
+						else //check exist first and then add linked list or modify counter
+						{
+							ref_prev = ref_head;
+							while(ref_prev != NULL) 
+							{
+								//printk("Ahsin PID= %d, Name= %s, Count= %d n=%d  current->pid=%d \n", ref_prev->pid, ref_prev->name, ref_prev->count,n,current->pid);
+								if (strcmp(ref_prev->name,current->comm)==0) //(ref_prev->pid==current->pid)//exist and find, modify counter
+								{
+									ref_prev->count = ref_prev->count + n;
+									s_total_count = s_total_count + n;
+									//printk("Ahsin (ref_prev->name,current->comm) pid=%d name=%s counter=%d n=%d \n",ref_prev->pid,ref_prev->name,ref_prev->count,n);
+									break;
+								}
+								else 
+								{
+									if (ref_prev->next != NULL) 
+										ref_prev = ref_prev->next;
+									else 
+									{	// end of link list
+										ref_current = kmalloc(sizeof(struct record_ref_count), GFP_KERNEL);
+										if (ref_current == NULL)
+										    printk("Ahsin can't allocate memory for ref_prev /n");
+
+						 				ref_current->next = NULL;
+										ref_current->pid = current->pid;
+										strncpy(ref_current->name, current->comm, TASK_COMM_LEN -1);					
+										ref_current->name[TASK_COMM_LEN -1] = '\0';
+										ref_current->count = n;
+										s_total_count = s_total_count + n;
+										ref_prev->next = ref_current;
+										//printk("Ahsin new node(end of link list) pid=%d name=%s counter=%d n=%d \n",ref_current->pid,ref_current->name,ref_current->count,n);
+										break;
+										
+									}
+								}
+							}
+						}
+						spin_unlock(&mnt_id_lock);
+					}
+					}
+			}
+
+#ifndef CONFIG_SMP
+	preempt_enable();
+#endif
+#endif
 #ifdef CONFIG_SMP
 	this_cpu_add(mnt->mnt_pcp->mnt_count, n);
+#ifdef UMOUNT_LOG
+#if 0
+	if (strcmp(UMOUNT_Partition,mnt->mnt_devname)==0)
+	{
+		if (strcmp("mobile_log_d",current->comm)!=0) 
+			{
+				printk("Ahsin s_total_count=%d mnt_get_count=%d n=%d  current->pid=%d \n",s_total_count,mnt_get_count(mnt),n,current->pid);
+			//if (current->pid < 100)
+				{	
+					// print linked list
+					spin_lock(&mnt_id_lock);
+					ref_current = ref_head;
+					while(ref_current != NULL) 
+					{
+						if (ref_current->count)
+							{
+								print_link_list = print_link_list + ref_current->count;
+								//printk("Ahsin PID= %d, Name = %s, Count= %d \n", ref_current->pid, ref_current->name, ref_current->count);
+							}
+						ref_current = ref_current->next;
+					}
+					spin_unlock(&mnt_id_lock);
+					printk("Ahsin print_link_list=%d \n",print_link_list);
+				}
+			}
+	}
+#endif	
+#endif
 #else
 	preempt_disable();
 	mnt->mnt_count += n;
@@ -183,6 +307,12 @@ static struct mount *alloc_vfsmnt(const char *name)
 		if (!mnt->mnt_pcp)
 			goto out_free_devname;
 
+#ifdef UMOUNT_LOG
+		if (strcmp(UMOUNT_Partition,mnt->mnt_devname)==0)
+		{
+			printk("Ahsin alloc_vfsmnt current->pid=%d name=%s \n",current->pid,current->comm);	
+		}
+#endif		
 		this_cpu_add(mnt->mnt_pcp->mnt_count, 1);
 #else
 		mnt->mnt_count = 1;
@@ -828,8 +958,21 @@ static struct mount *clone_mnt(struct mount *old, struct dentry *root,
 
 	mnt->mnt.mnt_flags = old->mnt.mnt_flags & ~MNT_WRITE_HOLD;
 	/* Don't allow unprivileged users to change mount flags */
-	if ((flag & CL_UNPRIVILEGED) && (mnt->mnt.mnt_flags & MNT_READONLY))
-		mnt->mnt.mnt_flags |= MNT_LOCK_READONLY;
+	if (flag & CL_UNPRIVILEGED) {
+		mnt->mnt.mnt_flags |= MNT_LOCK_ATIME;
+
+		if (mnt->mnt.mnt_flags & MNT_READONLY)
+			mnt->mnt.mnt_flags |= MNT_LOCK_READONLY;
+
+		if (mnt->mnt.mnt_flags & MNT_NODEV)
+			mnt->mnt.mnt_flags |= MNT_LOCK_NODEV;
+
+		if (mnt->mnt.mnt_flags & MNT_NOSUID)
+			mnt->mnt.mnt_flags |= MNT_LOCK_NOSUID;
+
+		if (mnt->mnt.mnt_flags & MNT_NOEXEC)
+			mnt->mnt.mnt_flags |= MNT_LOCK_NOEXEC;
+	}
 
 	atomic_inc(&sb->s_active);
 	mnt->mnt.mnt_sb = sb;
@@ -1261,6 +1404,8 @@ static int do_umount(struct mount *mnt, int flags)
 		 * Special case for "unmounting" root ...
 		 * we just try to remount it readonly.
 		 */
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
 		down_write(&sb->s_umount);
 		if (!(sb->s_flags & MS_RDONLY))
 			retval = do_remount_sb(sb, MS_RDONLY, NULL, 0);
@@ -1308,7 +1453,9 @@ SYSCALL_DEFINE2(umount, char __user *, name, int, flags)
 	struct mount *mnt;
 	int retval;
 	int lookup_flags = 0;
-
+#ifdef UMOUNT_LOG	
+	int total_value =0;
+#endif
 	if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
 		return -EINVAL;
 
@@ -1327,8 +1474,37 @@ SYSCALL_DEFINE2(umount, char __user *, name, int, flags)
 		goto dput_and_out;
 	if (!check_mnt(mnt))
 		goto dput_and_out;
+	retval = -EPERM;
+	if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
+		goto dput_and_out;
 
 	retval = do_umount(mnt, flags);
+#ifdef UMOUNT_LOG
+	{
+		printk("Ahsin do_umount retval=%d \n",retval);
+		//do_umount success: 0, do_umount busy: -16
+		//if do_umount fail, need to dump the link list here
+	
+		if(retval)
+			printk("Ahsin do_umount fail;  mnt_get_count=%d   mnt->mnt_devname=%s\n",mnt_get_count(mnt),mnt->mnt_devname);		
+		else
+			printk("Ahsin do_umount success;  mnt_get_count=%d   mnt->mnt_devname=%s\n",mnt_get_count(mnt),mnt->mnt_devname);		
+		
+		// print linked list
+		spin_lock(&mnt_id_lock);
+		ref_current = ref_head;
+		while(ref_current != NULL) 
+		{
+			total_value = total_value + ref_current->count;
+			
+			if (ref_current->count)
+				printk("Ahsin PID= %d, Name = %s, Count= %d \n", ref_current->pid, ref_current->name, ref_current->count);
+			ref_current = ref_current->next;
+		}
+		spin_unlock(&mnt_id_lock);
+		printk("Ahsin total_value=%d \n",total_value);
+	}
+#endif
 dput_and_out:
 	/* we mustn't call path_put() as that would clear mnt_expiry_mark */
 	dput(path.dentry);
@@ -1429,7 +1605,7 @@ struct vfsmount *collect_mounts(struct path *path)
 			 CL_COPY_ALL | CL_PRIVATE);
 	namespace_unlock();
 	if (IS_ERR(tree))
-		return NULL;
+		return ERR_CAST(tree);
 	return &tree->mnt;
 }
 
@@ -1764,9 +1940,6 @@ static int change_mount_flags(struct vfsmount *mnt, int ms_flags)
 	if (readonly_request == __mnt_is_readonly(mnt))
 		return 0;
 
-	if (mnt->mnt_flags & MNT_LOCK_READONLY)
-		return -EPERM;
-
 	if (readonly_request)
 		error = mnt_make_readonly(real_mount(mnt));
 	else
@@ -1792,6 +1965,39 @@ static int do_remount(struct path *path, int flags, int mnt_flags,
 	if (path->dentry != path->mnt->mnt_root)
 		return -EINVAL;
 
+	/* Don't allow changing of locked mnt flags.
+	 *
+	 * No locks need to be held here while testing the various
+	 * MNT_LOCK flags because those flags can never be cleared
+	 * once they are set.
+	 */
+	if ((mnt->mnt.mnt_flags & MNT_LOCK_READONLY) &&
+	    !(mnt_flags & MNT_READONLY)) {
+		return -EPERM;
+	}
+	if ((mnt->mnt.mnt_flags & MNT_LOCK_NODEV) &&
+	    !(mnt_flags & MNT_NODEV)) {
+		/* Was the nodev implicitly added in mount? */
+		if ((mnt->mnt_ns->user_ns != &init_user_ns) &&
+		    !(sb->s_type->fs_flags & FS_USERNS_DEV_MOUNT)) {
+			mnt_flags |= MNT_NODEV;
+		} else {
+			return -EPERM;
+		}
+	}
+	if ((mnt->mnt.mnt_flags & MNT_LOCK_NOSUID) &&
+	    !(mnt_flags & MNT_NOSUID)) {
+		return -EPERM;
+	}
+	if ((mnt->mnt.mnt_flags & MNT_LOCK_NOEXEC) &&
+	    !(mnt_flags & MNT_NOEXEC)) {
+		return -EPERM;
+	}
+	if ((mnt->mnt.mnt_flags & MNT_LOCK_ATIME) &&
+	    ((mnt->mnt.mnt_flags & MNT_ATIME_MASK) != (mnt_flags & MNT_ATIME_MASK))) {
+		return -EPERM;
+	}
+
 	err = security_sb_remount(sb, data);
 	if (err)
 		return err;
@@ -1805,7 +2011,7 @@ static int do_remount(struct path *path, int flags, int mnt_flags,
 		err = do_remount_sb(sb, flags, data, 0);
 	if (!err) {
 		br_write_lock(&vfsmount_lock);
-		mnt_flags |= mnt->mnt.mnt_flags & MNT_PROPAGATION_MASK;
+		mnt_flags |= mnt->mnt.mnt_flags & ~MNT_USER_SETTABLE_MASK;
 		mnt->mnt.mnt_flags = mnt_flags;
 		br_write_unlock(&vfsmount_lock);
 	}
@@ -1991,7 +2197,7 @@ static int do_new_mount(struct path *path, const char *fstype, int flags,
 		 */
 		if (!(type->fs_flags & FS_USERNS_DEV_MOUNT)) {
 			flags |= MS_NODEV;
-			mnt_flags |= MNT_NODEV;
+			mnt_flags |= MNT_NODEV | MNT_LOCK_NODEV;
 		}
 	}
 
@@ -2308,6 +2514,14 @@ long do_mount(const char *dev_name, const char *dir_name,
 		mnt_flags &= ~(MNT_RELATIME | MNT_NOATIME);
 	if (flags & MS_RDONLY)
 		mnt_flags |= MNT_READONLY;
+
+	/* The default atime for remount is preservation */
+	if ((flags & MS_REMOUNT) &&
+	    ((flags & (MS_NOATIME | MS_NODIRATIME | MS_RELATIME |
+		       MS_STRICTATIME)) == 0)) {
+		mnt_flags &= ~MNT_ATIME_MASK;
+		mnt_flags |= path.mnt->mnt_flags & MNT_ATIME_MASK;
+	}
 
 	flags &= ~(MS_NOSUID | MS_NOEXEC | MS_NODEV | MS_ACTIVE | MS_BORN |
 		   MS_NOATIME | MS_NODIRATIME | MS_RELATIME| MS_KERNMOUNT |
@@ -2648,6 +2862,9 @@ SYSCALL_DEFINE2(pivot_root, const char __user *, new_root,
 		goto out4; /* not attached */
 	/* make sure we can reach put_old from new_root */
 	if (!is_path_reachable(old_mnt, old.dentry, &new))
+		goto out4;
+	/* make certain new is below the root */
+	if (!is_path_reachable(new_mnt, new.dentry, &root))
 		goto out4;
 	root_mp->m_count++; /* pin it so it won't go away */
 	br_write_lock(&vfsmount_lock);
