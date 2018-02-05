@@ -163,6 +163,9 @@ static void addrconf_dad_run(struct inet6_dev *idev);
 static void addrconf_rs_timer(unsigned long data);
 static void __ipv6_ifa_notify(int event, struct inet6_ifaddr *ifa);
 static void ipv6_ifa_notify(int event, struct inet6_ifaddr *ifa);
+static void inet6_no_ra_notify(int event, struct inet6_dev *idev);
+static int inet6_fill_nora(struct sk_buff *skb, struct inet6_dev *idev,
+			      u32 portid, u32 seq,int event, unsigned int flags);
 
 static void inet6_prefix_notify(int event, struct inet6_dev *idev,
 				struct prefix_info *pinfo);
@@ -173,7 +176,7 @@ static struct ipv6_devconf ipv6_devconf __read_mostly = {
 	.forwarding		= 0,
 	.hop_limit		= IPV6_DEFAULT_HOPLIMIT,
 	.mtu6			= IPV6_MIN_MTU,
-	.accept_ra		= 1,
+	.accept_ra		= 1,	
 	.accept_redirects	= 1,
 	.autoconf		= 1,
 	.force_mld_version	= 0,
@@ -182,7 +185,7 @@ static struct ipv6_devconf ipv6_devconf __read_mostly = {
 	.rtr_solicit_interval	= RTR_SOLICITATION_INTERVAL,
 	.rtr_solicit_delay	= MAX_RTR_SOLICITATION_DELAY,
 #ifdef CONFIG_IPV6_PRIVACY
-	.use_tempaddr 		= 0,
+	.use_tempaddr 		= 1,
 	.temp_valid_lft		= TEMP_VALID_LIFETIME,
 	.temp_prefered_lft	= TEMP_PREFERRED_LIFETIME,
 	.regen_max_retry	= REGEN_MAX_RETRY,
@@ -191,6 +194,9 @@ static struct ipv6_devconf ipv6_devconf __read_mostly = {
 	.max_addresses		= IPV6_MAX_ADDRESSES,
 	.accept_ra_defrtr	= 1,
 	.accept_ra_pinfo	= 1,
+#ifdef CONFIG_MTK_DHCPV6C_WIFI	
+	.ra_info_flag		= 0,
+#endif		
 #ifdef CONFIG_IPV6_ROUTER_PREF
 	.accept_ra_rtr_pref	= 1,
 	.rtr_probe_interval	= 60 * HZ,
@@ -217,7 +223,7 @@ static struct ipv6_devconf ipv6_devconf_dflt __read_mostly = {
 	.rtr_solicit_interval	= RTR_SOLICITATION_INTERVAL,
 	.rtr_solicit_delay	= MAX_RTR_SOLICITATION_DELAY,
 #ifdef CONFIG_IPV6_PRIVACY
-	.use_tempaddr		= 0,
+	.use_tempaddr		= 1,
 	.temp_valid_lft		= TEMP_VALID_LIFETIME,
 	.temp_prefered_lft	= TEMP_PREFERRED_LIFETIME,
 	.regen_max_retry	= REGEN_MAX_RETRY,
@@ -226,6 +232,9 @@ static struct ipv6_devconf ipv6_devconf_dflt __read_mostly = {
 	.max_addresses		= IPV6_MAX_ADDRESSES,
 	.accept_ra_defrtr	= 1,
 	.accept_ra_pinfo	= 1,
+#ifdef CONFIG_MTK_DHCPV6C_WIFI	
+	.ra_info_flag		= 0,
+#endif	
 #ifdef CONFIG_IPV6_ROUTER_PREF
 	.accept_ra_rtr_pref	= 1,
 	.rtr_probe_interval	= 60 * HZ,
@@ -760,9 +769,10 @@ static int addrconf_fixup_forwarding(struct ctl_table *table, int *p, int newf)
 	} else if ((!newf) ^ (!old))
 		dev_forward_change((struct inet6_dev *)table->extra1);
 	rtnl_unlock();
-
+	
 	if (newf)
 		rt6_purge_dflt_routers(net);
+
 	return 1;
 }
 #endif
@@ -1113,8 +1123,11 @@ retry:
 	 * Lifetime is greater than REGEN_ADVANCE time units.  In particular,
 	 * an implementation must not create a temporary address with a zero
 	 * Preferred Lifetime.
+	 * Use age calculation as in addrconf_verify to avoid unnecessary
+	 * temporary addresses being generated.
 	 */
-	if (tmp_prefered_lft <= regen_advance) {
+	age = (now - tmp_tstamp + ADDRCONF_TIMER_FUZZ_MINUS) / HZ;
+	if (tmp_prefered_lft <= regen_advance + age) {
 		in6_ifa_put(ifp);
 		in6_dev_put(idev);
 		ret = -1;
@@ -1126,12 +1139,10 @@ retry:
 	if (ifp->flags & IFA_F_OPTIMISTIC)
 		addr_flags |= IFA_F_OPTIMISTIC;
 
-	ift = !max_addresses ||
-	      ipv6_count_addresses(idev) < max_addresses ?
-		ipv6_add_addr(idev, &addr, tmp_plen,
-			      ipv6_addr_type(&addr)&IPV6_ADDR_SCOPE_MASK,
-			      addr_flags) : NULL;
-	if (IS_ERR_OR_NULL(ift)) {
+	ift = ipv6_add_addr(idev, &addr, tmp_plen,
+			    ipv6_addr_type(&addr)&IPV6_ADDR_SCOPE_MASK,
+			    addr_flags);
+	if (IS_ERR(ift)) {
 		in6_ifa_put(ifp);
 		in6_dev_put(idev);
 		pr_info("%s: retry temporary address regeneration\n", __func__);
@@ -1476,6 +1487,23 @@ try_nextdev:
 }
 EXPORT_SYMBOL(ipv6_dev_get_saddr);
 
+int __ipv6_get_lladdr(struct inet6_dev *idev, struct in6_addr *addr,
+		      unsigned char banned_flags)
+{
+	struct inet6_ifaddr *ifp;
+	int err = -EADDRNOTAVAIL;
+
+	list_for_each_entry(ifp, &idev->addr_list, if_list) {
+		if (ifp->scope == IFA_LINK &&
+		    !(ifp->flags & banned_flags)) {
+			*addr = ifp->addr;
+			err = 0;
+			break;
+		}
+	}
+	return err;
+}
+
 int ipv6_get_lladdr(struct net_device *dev, struct in6_addr *addr,
 		    unsigned char banned_flags)
 {
@@ -1485,17 +1513,8 @@ int ipv6_get_lladdr(struct net_device *dev, struct in6_addr *addr,
 	rcu_read_lock();
 	idev = __in6_dev_get(dev);
 	if (idev) {
-		struct inet6_ifaddr *ifp;
-
 		read_lock_bh(&idev->lock);
-		list_for_each_entry(ifp, &idev->addr_list, if_list) {
-			if (ifp->scope == IFA_LINK &&
-			    !(ifp->flags & banned_flags)) {
-				*addr = ifp->addr;
-				err = 0;
-				break;
-			}
-		}
+		err = __ipv6_get_lladdr(idev, addr, banned_flags);
 		read_unlock_bh(&idev->lock);
 	}
 	rcu_read_unlock();
@@ -1556,6 +1575,33 @@ static bool ipv6_chk_same_addr(struct net *net, const struct in6_addr *addr,
 	}
 	return false;
 }
+
+/* Compares an address/prefix_len with addresses on device @dev.
+ * If one is found it returns true.
+ */
+bool ipv6_chk_custom_prefix(const struct in6_addr *addr,
+	const unsigned int prefix_len, struct net_device *dev)
+{
+	struct inet6_dev *idev;
+	struct inet6_ifaddr *ifa;
+	bool ret = false;
+
+	rcu_read_lock();
+	idev = __in6_dev_get(dev);
+	if (idev) {
+		read_lock_bh(&idev->lock);
+		list_for_each_entry(ifa, &idev->addr_list, if_list) {
+			ret = ipv6_prefix_equal(addr, &ifa->addr, prefix_len);
+			if (ret)
+				break;
+		}
+		read_unlock_bh(&idev->lock);
+	}
+	rcu_read_unlock();
+
+	return ret;
+}
+EXPORT_SYMBOL(ipv6_chk_custom_prefix);
 
 int ipv6_chk_prefix(const struct in6_addr *addr, struct net_device *dev)
 {
@@ -1833,6 +1879,10 @@ static int addrconf_ifid_gre(u8 *eui, struct net_device *dev)
 
 static int ipv6_generate_eui64(u8 *eui, struct net_device *dev)
 {
+    /* MTK_NET_CHANGES */
+    if (strncmp(dev->name, "ccmni", 2) == 0)
+        return -1;
+ 		
 	switch (dev->type) {
 	case ARPHRD_ETHER:
 	case ARPHRD_FDDI:
@@ -2711,8 +2761,18 @@ static void init_loopback(struct net_device *dev)
 			if (sp_ifa->flags & (IFA_F_DADFAILED | IFA_F_TENTATIVE))
 				continue;
 
-			if (sp_ifa->rt)
-				continue;
+			if (sp_ifa->rt) {
+				/* This dst has been added to garbage list when
+				 * lo device down, release this obsolete dst and
+				 * reallocate a new router for ifa.
+				 */
+				if (sp_ifa->rt->dst.obsolete > 0) {
+					ip6_rt_put(sp_ifa->rt);
+					sp_ifa->rt = NULL;
+				} else {
+					continue;
+				}
+			}
 
 			sp_rt = addrconf_dst_alloc(idev, &sp_ifa->addr, 0);
 
@@ -3202,12 +3262,13 @@ static void addrconf_rs_timer(unsigned long data)
 
 		ndisc_send_rs(idev->dev, &ifp->addr, &in6addr_linklocal_allrouters);
 	} else {
+		inet6_no_ra_notify(RTM_NORA,idev);
 		spin_unlock(&ifp->lock);
 		/*
 		 * Note: we do not support deprecated "all on-link"
 		 * assumption any longer.
 		 */
-		pr_debug("%s: no IPv6 routers present\n", idev->dev->name);
+		printk("%s: no IPv6 routers present\n", idev->dev->name);
 	}
 
 out:
@@ -4238,6 +4299,9 @@ static inline void ipv6_store_devconf(struct ipv6_devconf *cnf,
 	array[DEVCONF_ACCEPT_DAD] = cnf->accept_dad;
 	array[DEVCONF_FORCE_TLLAO] = cnf->force_tllao;
 	array[DEVCONF_NDISC_NOTIFY] = cnf->ndisc_notify;
+#ifdef CONFIG_MTK_DHCPV6C_WIFI	
+	array[DEVCONF_RA_INFO_FLAG] = cnf->ra_info_flag;
+#endif	
 }
 
 static inline size_t inet6_ifla6_size(void)
@@ -4657,6 +4721,64 @@ static void ipv6_ifa_notify(int event, struct inet6_ifaddr *ifp)
 	rcu_read_unlock_bh();
 }
 
+
+//mtk07384: send no ra netlink msg
+static void inet6_no_ra_notify(int event, struct inet6_dev *idev)
+			
+{  
+    struct sk_buff *skb;
+	struct net *net = dev_net(idev->dev);
+	int err = -ENOBUFS;
+	size_t length = NLMSG_ALIGN(sizeof(struct ifinfomsg));
+
+	skb = nlmsg_new(length, GFP_ATOMIC);
+	if (skb == NULL)
+		goto errout;
+
+	err = inet6_fill_nora(skb, idev,0, 0, event, 0);
+	if (err < 0) {
+		/* -EMSGSIZE implies BUG in inet6_prefix_nlmsg_size() */
+		WARN_ON(err == -EMSGSIZE);
+		kfree_skb(skb);
+		goto errout;
+	}
+
+	rtnl_notify(skb, net, 0, RTNLGRP_IPV6_PREFIX, NULL, GFP_ATOMIC);
+	return;
+errout:
+	if (err < 0)
+		rtnl_set_sk_err(net, RTNLGRP_IPV6_PREFIX, err);
+   
+}
+//mtk07384: fill skb for  no ra  msg
+static int inet6_fill_nora(struct sk_buff *skb, struct inet6_dev *idev,
+			      u32 portid, u32 seq,int event, unsigned int flags)
+{
+    struct net_device *dev = idev->dev;
+	struct nlmsghdr *nlh;
+	struct ifinfomsg *hdr;
+	void *protoinfo;
+	char *name;
+	
+	nlh = nlmsg_put(skb, portid, seq, event, sizeof(*hdr), flags);
+	if (nlh == NULL)
+		return -EMSGSIZE;
+
+    hdr = nlmsg_data(nlh);
+	hdr->ifi_family = AF_INET6;
+	hdr->__ifi_pad = 0;
+	hdr->ifi_type = dev->type;
+	hdr->ifi_index = dev->ifindex;
+	hdr->ifi_flags = dev_get_flags(dev);
+	hdr->ifi_change = 0;
+
+	return nlmsg_end(skb, nlh);
+
+
+nla_put_failure:
+	nlmsg_cancel(skb, nlh);
+	return -EMSGSIZE;
+}
 #ifdef CONFIG_SYSCTL
 
 static
@@ -5010,6 +5132,15 @@ static struct addrconf_sysctl_table
 			.mode           = 0644,
 			.proc_handler   = proc_dointvec
 		},
+#ifdef	CONFIG_MTK_DHCPV6C_WIFI	
+		{
+			.procname		= "ra_info_flag",
+			.data			= &ipv6_devconf.ra_info_flag,
+			.maxlen 		= sizeof(int),
+			.mode			= 0644,
+			.proc_handler	= proc_dointvec
+		},
+#endif
 		{
 			/* sentinel */
 		}

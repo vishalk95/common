@@ -146,6 +146,11 @@ static int min_percpu_pagelist_fract = 8;
 static int ngroups_max = NGROUPS_MAX;
 static const int cap_last_cap = CAP_LAST_CAP;
 
+/*this is needed for proc_doulongvec_minmax of sysctl_hung_task_timeout_secs */
+#ifdef CONFIG_DETECT_HUNG_TASK
+static unsigned long hung_task_timeout_max = (LONG_MAX/HZ);
+#endif
+
 #ifdef CONFIG_INOTIFY_USER
 #include <linux/inotify.h>
 #endif
@@ -968,6 +973,7 @@ static struct ctl_table kern_table[] = {
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= proc_dohung_task_timeout_secs,
+		.extra2		= &hung_task_timeout_max,
 	},
 	{
 		.procname	= "hung_task_warnings",
@@ -1045,6 +1051,16 @@ static struct ctl_table kern_table[] = {
 		.maxlen		= sizeof(sysctl_perf_event_sample_rate),
 		.mode		= 0644,
 		.proc_handler	= perf_proc_update_handler,
+		.extra1		= &one,
+	},
+	{
+		.procname	= "perf_cpu_time_max_percent",
+		.data		= &sysctl_perf_cpu_time_max_percent,
+		.maxlen		= sizeof(sysctl_perf_cpu_time_max_percent),
+		.mode		= 0644,
+		.proc_handler	= perf_cpu_time_max_percent_handler,
+		.extra1		= &zero,
+		.extra2		= &one_hundred,
 	},
 #endif
 #ifdef CONFIG_KMEMCHECK
@@ -1460,6 +1476,40 @@ static struct ctl_table vm_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,
 	},
+#ifdef CONFIG_MEMCG_ZNDSWAP
+	{
+		.procname	= "dt_swapcache",
+		.data		= &dt_swapcache,
+		.maxlen		= sizeof(dt_swapcache),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+	},
+	{
+		.procname	= "dt_writeback",
+		.data		= &dt_writeback,
+		.maxlen		= sizeof(dt_writeback),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+	},
+	{
+		.procname	= "dt_filecache",
+		.data		= &dt_filecache,
+		.maxlen		= sizeof(dt_filecache),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+	},
+	/*{
+		.procname	= "dt_free",
+		.data		= &dt_free,
+		.maxlen		= sizeof(dt_free),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+	},*/
+#endif
 	{ }
 };
 
@@ -1698,10 +1748,11 @@ static int _proc_do_string(void* data, int maxlen, int write,
 		len = 0;
 		p = buffer;
 		while (len < *lenp) {
-			if (get_user(c, p++))
+			if (get_user(c, p))
 				return -EFAULT;
 			if (c == 0 || c == '\n')
 				break;
+			p++;
 			len++;
 		}
 		if (len >= maxlen)

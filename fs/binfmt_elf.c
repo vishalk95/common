@@ -38,6 +38,10 @@
 #include <asm/param.h>
 #include <asm/page.h>
 
+#ifdef CONFIG_MTK_EXTMEM
+#include <linux/exm_driver.h>
+#endif
+
 #ifndef user_long_t
 #define user_long_t long
 #endif
@@ -552,11 +556,12 @@ out:
 
 static unsigned long randomize_stack_top(unsigned long stack_top)
 {
-	unsigned int random_variable = 0;
+	unsigned long random_variable = 0;
 
 	if ((current->flags & PF_RANDOMIZE) &&
 		!(current->personality & ADDR_NO_RANDOMIZE)) {
-		random_variable = get_random_int() & STACK_RND_MASK;
+		random_variable = (unsigned long) get_random_int();
+		random_variable &= STACK_RND_MASK;
 		random_variable <<= PAGE_SHIFT;
 	}
 #ifdef CONFIG_STACK_GROWSUP
@@ -1117,6 +1122,11 @@ static bool always_dump_vma(struct vm_area_struct *vma)
 	if (arch_vma_name(vma))
 		return true;
 
+#ifdef CONFIG_MTK_EXTMEM
+	if (extmem_in_mspace(vma))
+		return true;
+#endif
+
 	return false;
 }
 
@@ -1415,7 +1425,7 @@ static void fill_siginfo_note(struct memelfnote *note, user_siginfo_t *csigdata,
  *   long file_ofs
  * followed by COUNT filenames in ASCII: "FILE1" NUL "FILE2" NUL...
  */
-static void fill_files_note(struct memelfnote *note)
+static int fill_files_note(struct memelfnote *note)
 {
 	struct vm_area_struct *vma;
 	unsigned count, size, names_ofs, remaining, n;
@@ -1430,11 +1440,11 @@ static void fill_files_note(struct memelfnote *note)
 	names_ofs = (2 + 3 * count) * sizeof(data[0]);
  alloc:
 	if (size >= MAX_FILE_NOTE_SIZE) /* paranoia check */
-		goto err;
+		return -EINVAL;
 	size = round_up(size, PAGE_SIZE);
 	data = vmalloc(size);
 	if (!data)
-		goto err;
+		return -ENOMEM;
 
 	start_end_ofs = data + 2;
 	name_base = name_curpos = ((char *)data) + names_ofs;
@@ -1487,7 +1497,7 @@ static void fill_files_note(struct memelfnote *note)
 
 	size = name_curpos - (char *)data;
 	fill_note(note, "CORE", NT_FILE, size, data);
- err: ;
+	return 0;
 }
 
 #ifdef CORE_DUMP_USE_REGSET
@@ -1688,8 +1698,8 @@ static int fill_note_info(struct elfhdr *elf, int phdrs,
 	fill_auxv_note(&info->auxv, current->mm);
 	info->size += notesize(&info->auxv);
 
-	fill_files_note(&info->files);
-	info->size += notesize(&info->files);
+	if (fill_files_note(&info->files) == 0)
+		info->size += notesize(&info->files);
 
 	return 1;
 }
@@ -1721,7 +1731,8 @@ static int write_note_info(struct elf_note_info *info,
 			return 0;
 		if (first && !writenote(&info->auxv, file, foffset))
 			return 0;
-		if (first && !writenote(&info->files, file, foffset))
+		if (first && info->files.data &&
+				!writenote(&info->files, file, foffset))
 			return 0;
 
 		for (i = 1; i < info->thread_notes; ++i)
@@ -1808,6 +1819,7 @@ static int elf_dump_thread_status(long signr, struct elf_thread_status *t)
 
 struct elf_note_info {
 	struct memelfnote *notes;
+	struct memelfnote *notes_files;
 	struct elf_prstatus *prstatus;	/* NT_PRSTATUS */
 	struct elf_prpsinfo *psinfo;	/* NT_PRPSINFO */
 	struct list_head thread_list;
@@ -1898,9 +1910,12 @@ static int fill_note_info(struct elfhdr *elf, int phdrs,
 
 	fill_siginfo_note(info->notes + 2, &info->csigdata, siginfo);
 	fill_auxv_note(info->notes + 3, current->mm);
-	fill_files_note(info->notes + 4);
+	info->numnote = 4;
 
-	info->numnote = 5;
+	if (fill_files_note(info->notes + info->numnote) == 0) {
+		info->notes_files = info->notes + info->numnote;
+		info->numnote++;
+	}
 
 	/* Try to dump the FPU. */
 	info->prstatus->pr_fpvalid = elf_core_copy_task_fpregs(current, regs,
@@ -1962,8 +1977,9 @@ static void free_note_info(struct elf_note_info *info)
 		kfree(list_entry(tmp, struct elf_thread_status, list));
 	}
 
-	/* Free data allocated by fill_files_note(): */
-	vfree(info->notes[4].data);
+	/* Free data possibly allocated by fill_files_note(): */
+	if (info->notes_files)
+		vfree(info->notes_files->data);
 
 	kfree(info->prstatus);
 	kfree(info->psinfo);
@@ -2046,11 +2062,13 @@ static int elf_core_dump(struct coredump_params *cprm)
 	struct vm_area_struct *vma, *gate_vma;
 	struct elfhdr *elf = NULL;
 	loff_t offset = 0, dataoff, foffset;
-	struct elf_note_info info;
+	struct elf_note_info info = { };
 	struct elf_phdr *phdr4note = NULL;
 	struct elf_shdr *shdr4extnum = NULL;
 	Elf_Half e_phnum;
 	elf_addr_t e_shoff;
+
+	printk(KERN_WARNING "coredump(%d): start\n", current->pid);
 
 	/*
 	 * We no longer stop all VM operations.
@@ -2180,6 +2198,8 @@ static int elf_core_dump(struct coredump_params *cprm)
 	if (!dump_seek(cprm->file, dataoff - foffset))
 		goto end_coredump;
 
+	printk(KERN_WARNING "coredump(%d): write output program header and notes\n", current->pid);
+
 	for (vma = first_vma(current, gate_vma); vma != NULL;
 			vma = next_vma(vma, gate_vma)) {
 		unsigned long addr;
@@ -2187,6 +2207,25 @@ static int elf_core_dump(struct coredump_params *cprm)
 
 		end = vma->vm_start + vma_dump_size(vma, cprm->mm_flags);
 
+#ifdef CONFIG_MTK_EXTMEM
+		if (extmem_in_mspace(vma)) {
+			void *extmem_va = (void *)get_virt_from_mspace(vma->vm_pgoff << PAGE_SHIFT);
+			for (addr = vma->vm_start; addr < end; addr += PAGE_SIZE, extmem_va += PAGE_SIZE) {
+				int stop;
+				int dump_write_ret = dump_write(cprm->file, extmem_va, PAGE_SIZE);
+
+				stop = ((size += PAGE_SIZE) > cprm->limit) || (!dump_write_ret);
+				if (stop) {
+					pr_err("[EXT_MEM]stop addr:0x%lx, size:%zx, limit:0x%lx, dump_write_ret:%d\n", 
+						addr, size, cprm->limit, dump_write_ret);
+					goto end_coredump;
+				}
+			}
+			continue;
+		}
+#endif
+
+		//printk(KERN_WARNING "coredump(%d): write out load vm start:%08lx, end:%08lx\n", current->pid, vma->vm_start, end);
 		for (addr = vma->vm_start; addr < end; addr += PAGE_SIZE) {
 			struct page *page;
 			int stop;
@@ -2199,12 +2238,21 @@ static int elf_core_dump(struct coredump_params *cprm)
 						    PAGE_SIZE);
 				kunmap(page);
 				page_cache_release(page);
-			} else
+				if (stop) {
+					printk(KERN_WARNING "coredump(%d): failed to write core dump\n", current->pid);
+				}
+			} else {
 				stop = !dump_seek(cprm->file, PAGE_SIZE);
+				if (stop) {
+					printk(KERN_WARNING "coredump(%d): failed to seek core dump\n", current->pid);
+				}
+			}
 			if (stop)
 				goto end_coredump;
 		}
 	}
+
+	printk(KERN_WARNING "coredump(%d): write loads\n", current->pid);
 
 	if (!elf_core_write_extra_data(cprm->file, &size, cprm->limit))
 		goto end_coredump;
@@ -2216,6 +2264,8 @@ static int elf_core_dump(struct coredump_params *cprm)
 				   sizeof(*shdr4extnum)))
 			goto end_coredump;
 	}
+
+	printk(KERN_WARNING "coredump(%d): write out completed %lld\n", current->pid, offset);
 
 end_coredump:
 	set_fs(fs);

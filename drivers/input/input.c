@@ -257,9 +257,10 @@ static int input_handle_abs_event(struct input_dev *dev,
 }
 
 static int input_get_disposition(struct input_dev *dev,
-			  unsigned int type, unsigned int code, int value)
+			  unsigned int type, unsigned int code, int *pval)
 {
 	int disposition = INPUT_IGNORE_EVENT;
+	int value = *pval;
 
 	switch (type) {
 
@@ -357,6 +358,7 @@ static int input_get_disposition(struct input_dev *dev,
 		break;
 	}
 
+	*pval = value;
 	return disposition;
 }
 
@@ -365,7 +367,7 @@ static void input_handle_event(struct input_dev *dev,
 {
 	int disposition;
 
-	disposition = input_get_disposition(dev, type, code, value);
+	disposition = input_get_disposition(dev, type, code, &value);
 
 	if ((disposition & INPUT_PASS_TO_DEVICE) && dev->event)
 		dev->event(dev, type, code, value);
@@ -665,15 +667,18 @@ EXPORT_SYMBOL(input_close_device);
  */
 static void input_dev_release_keys(struct input_dev *dev)
 {
-	int code;
+//	int code;
 
 	if (is_event_supported(EV_KEY, dev->evbit, EV_MAX)) {
+/* fixed long press key is interrupted */
+#if 0
 		for (code = 0; code <= KEY_MAX; code++) {
 			if (is_event_supported(code, dev->keybit, KEY_MAX) &&
 			    __test_and_clear_bit(code, dev->key)) {
 				input_pass_event(dev, EV_KEY, code, 0);
 			}
 		}
+#endif
 		input_pass_event(dev, EV_SYN, SYN_REPORT, 1);
 	}
 }
@@ -1866,6 +1871,10 @@ void input_set_capability(struct input_dev *dev, unsigned int type, unsigned int
 		break;
 
 	case EV_ABS:
+		input_alloc_absinfo(dev);
+		if (!dev->absinfo)
+			return;
+
 		__set_bit(code, dev->absbit);
 		break;
 

@@ -178,6 +178,8 @@ static int pstore_unlink(struct inode *dir, struct dentry *dentry)
 	if (p->psi->erase)
 		p->psi->erase(p->type, p->id, p->count,
 			      dentry->d_inode->i_ctime, p->psi);
+	else
+		return -EPERM;
 
 	return simple_unlink(dir, dentry);
 }
@@ -324,7 +326,6 @@ int pstore_mkfile(enum pstore_type_id type, char *psname, u64 id, int count,
 		scnprintf(name, sizeof(name), "ftrace-%s", psname);
 		break;
 	case PSTORE_TYPE_MCE:
-		scnprintf(name, sizeof(name), "mce-%s-%lld", psname, id);
 		break;
 	case PSTORE_TYPE_PMSG:
 		scnprintf(name, sizeof(name), "pmsg-%s-%lld", psname, id);
@@ -340,9 +341,8 @@ int pstore_mkfile(enum pstore_type_id type, char *psname, u64 id, int count,
 
 	mutex_lock(&root->d_inode->i_mutex);
 
-	rc = -ENOSPC;
 	dentry = d_alloc_name(root, name);
-	if (IS_ERR(dentry))
+	if (!dentry)
 		goto fail_lockedalloc;
 
 	memcpy(private->data, data, size);

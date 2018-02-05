@@ -32,6 +32,7 @@
 #include <sound/pcm_params.h>
 #include <sound/timer.h>
 
+#define DEBUG
 /*
  * fill ring buffer with silence
  * runtime->silence_start: starting pointer to silence area
@@ -365,13 +366,17 @@ static int snd_pcm_update_hw_ptr0(struct snd_pcm_substream *substream,
 		if (delta > new_hw_ptr) {
 			/* check for double acknowledged interrupts */
 			hdelta = curr_jiffies - runtime->hw_ptr_jiffies;
-			if (hdelta > runtime->hw_ptr_buffer_jiffies/2) {
+			//MTK modify+++
+			//if (hdelta > runtime->hw_ptr_buffer_jiffies/2) {  //Alsa origin
+			if (0) {  //MTK modified
+			//MTK modify---
 				hw_base += runtime->buffer_size;
 				if (hw_base >= runtime->boundary) {
 					hw_base = 0;
 					crossed_boundary++;
 				}
 				new_hw_ptr = hw_base + pos;
+				pr_debug("%s, overflow? new_hw_ptr=%ld, hw_base=%ld\n",__FUNCTION__,new_hw_ptr,hw_base);
 				goto __delta;
 			}
 		}
@@ -1782,14 +1787,16 @@ static int snd_pcm_lib_ioctl_fifo_size(struct snd_pcm_substream *substream,
 {
 	struct snd_pcm_hw_params *params = arg;
 	snd_pcm_format_t format;
-	int channels, width;
+	int channels;
+	ssize_t frame_size;
 
 	params->fifo_size = substream->runtime->hw.fifo_size;
 	if (!(substream->runtime->hw.info & SNDRV_PCM_INFO_FIFO_IN_FRAMES)) {
 		format = params_format(params);
 		channels = params_channels(params);
-		width = snd_pcm_format_physical_width(format);
-		params->fifo_size /= width * channels;
+		frame_size = snd_pcm_format_size(format, channels);
+		if (frame_size > 0)
+			params->fifo_size /= (unsigned)frame_size;
 	}
 	return 0;
 }
@@ -1885,7 +1892,7 @@ static int wait_for_avail(struct snd_pcm_substream *substream,
 	if (runtime->no_period_wakeup)
 		wait_time = MAX_SCHEDULE_TIMEOUT;
 	else {
-		wait_time = 10;
+		wait_time = 3/*10*/;//Modified by MTK
 		if (runtime->rate) {
 			long t = runtime->period_size * 2 / runtime->rate;
 			wait_time = max(t, wait_time);
@@ -1936,6 +1943,8 @@ static int wait_for_avail(struct snd_pcm_substream *substream,
 		case SNDRV_PCM_STATE_DISCONNECTED:
 			err = -EBADFD;
 			goto _endloop;
+		case SNDRV_PCM_STATE_PAUSED:
+			continue;
 		}
 		if (!tout) {
 			snd_printd("%s write error (DMA or IRQ trouble?)\n",

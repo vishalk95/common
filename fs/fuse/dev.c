@@ -7,6 +7,7 @@
 */
 
 #include "fuse_i.h"
+#include "fuse.h"
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -488,6 +489,21 @@ __acquires(fc->lock)
 	}
 }
 
+#ifdef MET_FUSEIO_TRACE
+#define CREATE_TRACE_POINTS
+#include <linux/met_ftrace_fuse.h>
+
+void met_fuse_start(int t_pid, char *t_name, unsigned int op, unsigned int size)
+{
+	MET_FTRACE_PRINTK(met_fuse_start, t_pid, t_name, op, size);
+}
+
+void met_fuse_stop(int t_pid, char *t_name, unsigned int op, unsigned int size)
+{
+	MET_FTRACE_PRINTK(met_fuse_stop, t_pid, t_name, op, size);
+}
+#endif
+
 static void __fuse_request_send(struct fuse_conn *fc, struct fuse_req *req)
 {
 	BUG_ON(req->background);
@@ -508,10 +524,35 @@ static void __fuse_request_send(struct fuse_conn *fc, struct fuse_req *req)
 	spin_unlock(&fc->lock);
 }
 
+void fuse_request_send_ex(struct fuse_conn *fc, struct fuse_req *req,
+    __u32 size)
+{
+	FUSE_IOLOG_INIT(size, req->in.h.opcode);
+#ifdef MET_FUSEIO_TRACE
+	int pid;
+	char task_name[TASK_COMM_LEN];
+	unsigned int opcode;
+#endif
+	req->isreply = 1;
+#ifdef MET_FUSEIO_TRACE
+	pid = task_pid_nr(current);
+	get_task_comm(task_name, current);
+	opcode = req->in.h.opcode;
+	met_fuse_start(pid, task_name, opcode, size);
+#endif
+	FUSE_IOLOG_START();
+	__fuse_request_send(fc, req);
+#ifdef MET_FUSEIO_TRACE
+	met_fuse_stop(pid, task_name, opcode, size);
+#endif
+	FUSE_IOLOG_END();
+	FUSE_IOLOG_PRINT();
+}
+EXPORT_SYMBOL_GPL(fuse_request_send_ex);
+
 void fuse_request_send(struct fuse_conn *fc, struct fuse_req *req)
 {
-	req->isreply = 1;
-	__fuse_request_send(fc, req);
+	fuse_request_send_ex(fc, req, 0);
 }
 EXPORT_SYMBOL_GPL(fuse_request_send);
 
@@ -543,10 +584,33 @@ static void fuse_request_send_nowait(struct fuse_conn *fc, struct fuse_req *req)
 	}
 }
 
-void fuse_request_send_background(struct fuse_conn *fc, struct fuse_req *req)
+void fuse_request_send_background_ex(struct fuse_conn *fc, struct fuse_req *req,
+    __u32 size)
 {
+	FUSE_IOLOG_INIT(size, req->in.h.opcode);
+#ifdef MET_FUSEIO_TRACE
+	int pid;
+	char task_name[TASK_COMM_LEN];
+	unsigned int opcode;
+	pid = task_pid_nr(current);
+	get_task_comm(task_name, current);
+	opcode = req->in.h.opcode;
+	met_fuse_start(pid, task_name, opcode, size);
+#endif
+	FUSE_IOLOG_START();
 	req->isreply = 1;
 	fuse_request_send_nowait(fc, req);
+#ifdef MET_FUSEIO_TRACE
+	met_fuse_stop(pid, task_name, opcode, size);
+#endif
+	FUSE_IOLOG_END();
+	FUSE_IOLOG_PRINT();
+}
+EXPORT_SYMBOL_GPL(fuse_request_send_background_ex);
+
+void fuse_request_send_background(struct fuse_conn *fc, struct fuse_req *req)
+{
+    fuse_request_send_background_ex(fc, req, 0);
 }
 EXPORT_SYMBOL_GPL(fuse_request_send_background);
 
@@ -1300,22 +1364,6 @@ static ssize_t fuse_dev_read(struct kiocb *iocb, const struct iovec *iov,
 	return fuse_dev_do_read(fc, file, &cs, iov_length(iov, nr_segs));
 }
 
-static int fuse_dev_pipe_buf_steal(struct pipe_inode_info *pipe,
-				   struct pipe_buffer *buf)
-{
-	return 1;
-}
-
-static const struct pipe_buf_operations fuse_dev_pipe_buf_ops = {
-	.can_merge = 0,
-	.map = generic_pipe_buf_map,
-	.unmap = generic_pipe_buf_unmap,
-	.confirm = generic_pipe_buf_confirm,
-	.release = generic_pipe_buf_release,
-	.steal = fuse_dev_pipe_buf_steal,
-	.get = generic_pipe_buf_get,
-};
-
 static ssize_t fuse_dev_splice_read(struct file *in, loff_t *ppos,
 				    struct pipe_inode_info *pipe,
 				    size_t len, unsigned int flags)
@@ -1362,7 +1410,11 @@ static ssize_t fuse_dev_splice_read(struct file *in, loff_t *ppos,
 		buf->page = bufs[page_nr].page;
 		buf->offset = bufs[page_nr].offset;
 		buf->len = bufs[page_nr].len;
-		buf->ops = &fuse_dev_pipe_buf_ops;
+		/*
+		 * Need to be careful about this.  Having buf->ops in module
+		 * code can Oops if the buffer persists after module unload.
+		 */
+		buf->ops = &nosteal_pipe_buf_ops;
 
 		pipe->nrbufs++;
 		page_nr++;

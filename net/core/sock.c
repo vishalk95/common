@@ -135,12 +135,65 @@
 
 #include <trace/events/sock.h>
 
+#include <net/af_unix.h>
+
+
 #ifdef CONFIG_INET
 #include <net/tcp.h>
 #endif
+#include <linux/xlog.h>
 
 static DEFINE_MUTEX(proto_list_mutex);
 static LIST_HEAD(proto_list);
+
+/**
+ * sk_ns_capable - General socket capability test
+ * @sk: Socket to use a capability on or through
+ * @user_ns: The user namespace of the capability to use
+ * @cap: The capability to use
+ *
+ * Test to see if the opener of the socket had when the socket was
+ * created and the current process has the capability @cap in the user
+ * namespace @user_ns.
+ */
+bool sk_ns_capable(const struct sock *sk,
+		   struct user_namespace *user_ns, int cap)
+{
+	return file_ns_capable(sk->sk_socket->file, user_ns, cap) &&
+		ns_capable(user_ns, cap);
+}
+EXPORT_SYMBOL(sk_ns_capable);
+
+/**
+ * sk_capable - Socket global capability test
+ * @sk: Socket to use a capability on or through
+ * @cap: The global capbility to use
+ *
+ * Test to see if the opener of the socket had when the socket was
+ * created and the current process has the capability @cap in all user
+ * namespaces.
+ */
+bool sk_capable(const struct sock *sk, int cap)
+{
+	return sk_ns_capable(sk, &init_user_ns, cap);
+}
+EXPORT_SYMBOL(sk_capable);
+
+/**
+ * sk_net_capable - Network namespace socket capability test
+ * @sk: Socket to use a capability on or through
+ * @cap: The capability to use
+ *
+ * Test to see if the opener of the socket had when the socke was created
+ * and the current process has the capability @cap over the network namespace
+ * the socket is a member of.
+ */
+bool sk_net_capable(const struct sock *sk, int cap)
+{
+	return sk_ns_capable(sk, sock_net(sk)->user_ns, cap);
+}
+EXPORT_SYMBOL(sk_net_capable);
+
 
 #ifdef CONFIG_MEMCG_KMEM
 int mem_cgroup_sockets_init(struct mem_cgroup *memcg, struct cgroup_subsys *ss)
@@ -264,7 +317,7 @@ static struct lock_class_key af_callback_keys[AF_MAX];
 /* Run time adjustable parameters. */
 __u32 sysctl_wmem_max __read_mostly = SK_WMEM_MAX;
 EXPORT_SYMBOL(sysctl_wmem_max);
-__u32 sysctl_rmem_max __read_mostly = SK_RMEM_MAX;
+__u32 sysctl_rmem_max __read_mostly = (SK_RMEM_MAX*8);
 EXPORT_SYMBOL(sysctl_rmem_max);
 __u32 sysctl_wmem_default __read_mostly = SK_WMEM_MAX;
 __u32 sysctl_rmem_default __read_mostly = SK_RMEM_MAX;
@@ -885,7 +938,7 @@ set_rcvbuf:
 
 	case SO_PEEK_OFF:
 		if (sock->ops->set_peek_off)
-			sock->ops->set_peek_off(sk, val);
+			ret = sock->ops->set_peek_off(sk, val);
 		else
 			ret = -EOPNOTSUPP;
 		break;
@@ -1584,6 +1637,12 @@ kuid_t sock_i_uid(struct sock *sk)
 {
 	kuid_t uid;
 
+	/*mtk_net: fix kernel bug*/
+	if (!sk) {
+		pr_info("sk == NULL for sock_i_uid\n");
+		return GLOBAL_ROOT_UID;
+	}
+
 	read_lock_bh(&sk->sk_callback_lock);
 	uid = sk->sk_socket ? SOCK_INODE(sk->sk_socket)->i_uid : GLOBAL_ROOT_UID;
 	read_unlock_bh(&sk->sk_callback_lock);
@@ -1694,6 +1753,67 @@ static long sock_wait_for_wmem(struct sock *sk, long timeo)
 }
 
 
+//debug funcion
+
+static int sock_dump_info(struct sock *sk)
+{
+
+	if (sk->sk_family == AF_UNIX) {
+		struct unix_sock *u = unix_sk(sk);
+		struct sock *other = NULL;
+
+		if ((u->path.dentry != NULL) && (u->path.dentry->d_iname != NULL)) {
+#ifdef CONFIG_MTK_NET_LOGGING
+			pr_debug("[mtk_net][sock]sockdbg: socket-Name:%s\n",
+				 u->path.dentry->d_iname);
+#endif
+		} else {
+#ifdef CONFIG_MTK_NET_LOGGING
+			pr_debug("[mtk_net][sock]sockdbg:socket Name (NULL)\n");
+#endif
+		}
+
+		if (sk->sk_socket && SOCK_INODE(sk->sk_socket)) {
+#ifdef CONFIG_MTK_NET_LOGGING
+			pr_debug("[mtk_net][sock]sockdbg:socket Inode[%lu]\n",
+				 SOCK_INODE(sk->sk_socket)->i_ino);
+#endif
+		}
+
+		other = unix_sk(sk)->peer;
+		if (!other) {
+#ifdef CONFIG_MTK_NET_LOGGING
+			pr_debug("[mtk_net][sock]sockdbg:peer is (NULL)\n");
+#endif
+		} else {
+
+			if ((((struct unix_sock *)other)->path.dentry != NULL)
+			    && (((struct unix_sock *)other)->path.dentry->d_iname != NULL)) {
+#ifdef CONFIG_MTK_NET_LOGGING
+				pr_debug("[mtk_net][sock]sockdbg: Peer Name:%s\n",
+					 ((struct unix_sock *)other)->path.dentry->d_iname);
+#endif
+			} else {
+#ifdef CONFIG_MTK_NET_LOGGING
+				pr_debug("[mtk_net][sock]sockdbg: Peer Name (NULL)\n");
+#endif
+			}
+
+			if (other->sk_socket && SOCK_INODE(other->sk_socket)) {
+#ifdef CONFIG_MTK_NET_LOGGING
+				pr_debug("[mtk_net][sock]sockdbg: Peer Inode [%lu]\n",
+					 SOCK_INODE(other->sk_socket)->i_ino);
+#endif
+			}
+#ifdef CONFIG_MTK_NET_LOGGING
+			pr_debug("[mtk_net][sock]sockdbg: Peer Receive Queue len:%d\n",
+				 other->sk_receive_queue.qlen);
+#endif
+		}
+	}
+	return 0;
+}
+
 /*
  *	Generic send/receive buffer handlers
  */
@@ -1769,7 +1889,16 @@ struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
 			goto failure;
 		if (signal_pending(current))
 			goto interrupted;
+	sock_dump_info(sk);
+		#ifdef CONFIG_MTK_NET_LOGGING
+		pr_debug("[mtk_net][sock]sockdbg: wait_for_wmem, timeo =%ld, wmem =%d, snd buf =%d\n",
+timeo, atomic_read(&sk->sk_wmem_alloc), sk->sk_sndbuf);
+	#endif
 		timeo = sock_wait_for_wmem(sk, timeo);
+		#ifdef CONFIG_MTK_NET_LOGGING
+		pr_debug("[mtk_net][sock]sockdbg: wait_for_wmem done, header_len=0x%lx, data_len=0x%lx,timeo =%ld\n",
+header_len, data_len, timeo);
+	    #endif
 	}
 
 	skb_set_owner_w(skb, sk);
@@ -1814,7 +1943,7 @@ bool sk_page_frag_refill(struct sock *sk, struct page_frag *pfrag)
 		gfp_t gfp = sk->sk_allocation;
 
 		if (order)
-			gfp |= __GFP_COMP | __GFP_NOWARN;
+			gfp |= __GFP_COMP | __GFP_NOWARN | __GFP_NORETRY;
 		pfrag->page = alloc_pages(gfp, order);
 		if (likely(pfrag->page)) {
 			pfrag->offset = 0;
@@ -2271,6 +2400,7 @@ void sock_init_data(struct socket *sock, struct sock *sk)
 
 	sk->sk_stamp = ktime_set(-1L, 0);
 
+	sk->sk_pacing_rate = ~0U;
 	/*
 	 * Before updating sk_refcnt, we must commit prior changes to memory
 	 * (Documentation/RCU/rculist_nulls.txt for details)
@@ -2308,10 +2438,13 @@ void release_sock(struct sock *sk)
 	if (sk->sk_backlog.tail)
 		__release_sock(sk);
 
+	/* Warning : release_cb() might need to release sk ownership,
+	 * ie call sock_release_ownership(sk) before us.
+	 */
 	if (sk->sk_prot->release_cb)
 		sk->sk_prot->release_cb(sk);
 
-	sk->sk_lock.owned = 0;
+	sock_release_ownership(sk);
 	if (waitqueue_active(&sk->sk_lock.wq))
 		wake_up(&sk->sk_lock.wq);
 	spin_unlock_bh(&sk->sk_lock.slock);

@@ -17,6 +17,8 @@
 
 #include "internals.h"
 
+#include "mt_sched_mon.h"
+
 /*
  * lockdep: we want to handle all irq_desc locks as a single lock-class:
  */
@@ -274,6 +276,7 @@ struct irq_desc *irq_to_desc(unsigned int irq)
 {
 	return (irq < NR_IRQS) ? irq_desc + irq : NULL;
 }
+EXPORT_SYMBOL(irq_to_desc);
 
 static void free_desc(unsigned int irq)
 {

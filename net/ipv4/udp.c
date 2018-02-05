@@ -123,6 +123,18 @@ EXPORT_SYMBOL(sysctl_udp_rmem_min);
 int sysctl_udp_wmem_min __read_mostly;
 EXPORT_SYMBOL(sysctl_udp_wmem_min);
 
+#ifdef UDP_SKT_WIFI
+#include <linux/kallsyms.h>
+#include <linux/ftrace_event.h>
+int sysctl_udp_met_port __read_mostly = -1;
+EXPORT_SYMBOL(sysctl_udp_met_port);
+int sysctl_met_is_enable __read_mostly = -1;
+EXPORT_SYMBOL(sysctl_met_is_enable);
+#ifdef CONFIG_TRACING
+unsigned long __read_mostly udp_tracing_mark_write_addr = 0;
+#endif
+#endif
+
 atomic_long_t udp_memory_allocated;
 EXPORT_SYMBOL(udp_memory_allocated);
 
@@ -799,7 +811,7 @@ send:
 /*
  * Push out all pending data as one UDP datagram. Socket is locked.
  */
-static int udp_push_pending_frames(struct sock *sk)
+int udp_push_pending_frames(struct sock *sk)
 {
 	struct udp_sock  *up = udp_sk(sk);
 	struct inet_sock *inet = inet_sk(sk);
@@ -818,6 +830,21 @@ out:
 	up->pending = 0;
 	return err;
 }
+EXPORT_SYMBOL(udp_push_pending_frames);
+
+#ifdef UDP_SKT_WIFI
+void udp_event_trace_printk(const char * fmt, int pid, __u16 port)
+{
+
+#ifdef CONFIG_TRACING
+	if(unlikely(0 == udp_tracing_mark_write_addr)) {
+	    udp_tracing_mark_write_addr = kallsyms_lookup_name("tracing_mark_write");
+	}
+	event_trace_printk(udp_tracing_mark_write_addr, fmt, pid, MET_SOCKET_LATENCY_NAME, ntohs(port));
+#endif
+}
+EXPORT_SYMBOL(udp_event_trace_printk);
+#endif
 
 int udp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 		size_t len)
@@ -903,6 +930,19 @@ int udp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 
 	ipc.oif = sk->sk_bound_dev_if;
 
+#ifdef UDP_SKT_WIFI
+	
+	if (unlikely((sysctl_met_is_enable == 1) && (sysctl_udp_met_port > 0))) {
+		
+	    if ((ntohs(inet->inet_sport) == sysctl_udp_met_port) && (len >= 4)) {
+	        __u16 * seq_id = (__u16 *)((char *)msg->msg_iov->iov_base + 2);
+	        udp_event_trace_printk("S|%d|%s|%d\n", current->pid, *seq_id);
+	        
+	    }
+	}
+#endif
+
+
 	sock_tx_timestamp(sk, &ipc.tx_flags);
 
 	if (msg->msg_controllen) {
@@ -971,7 +1011,7 @@ int udp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 			err = PTR_ERR(rt);
 			rt = NULL;
 			if (err == -ENETUNREACH)
-				IP_INC_STATS_BH(net, IPSTATS_MIB_OUTNOROUTES);
+				IP_INC_STATS(net, IPSTATS_MIB_OUTNOROUTES);
 			goto out;
 		}
 
@@ -1048,7 +1088,8 @@ out:
 	 * things).  We could add another new stat but at least for now that
 	 * seems like overkill.
 	 */
-	if (err == -ENOBUFS || test_bit(SOCK_NOSPACE, &sk->sk_socket->flags)) {
+	 /* MTK_NET */
+	if (err == -ENOBUFS || (sk->sk_socket && test_bit(SOCK_NOSPACE, &sk->sk_socket->flags)) ) {
 		UDP_INC_STATS_USER(sock_net(sk),
 				UDP_MIB_SNDBUFERRORS, is_udplite);
 	}
@@ -1069,6 +1110,9 @@ int udp_sendpage(struct sock *sk, struct page *page, int offset,
 	struct inet_sock *inet = inet_sk(sk);
 	struct udp_sock *up = udp_sk(sk);
 	int ret;
+
+	if (flags & MSG_SENDPAGE_NOTLAST)
+		flags |= MSG_MORE;
 
 	if (!up->pending) {
 		struct msghdr msg = {	.msg_flags = flags|MSG_MORE };
@@ -1207,14 +1251,8 @@ int udp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 	int is_udplite = IS_UDPLITE(sk);
 	bool slow;
 
-	/*
-	 *	Check any passed addresses
-	 */
-	if (addr_len)
-		*addr_len = sizeof(*sin);
-
 	if (flags & MSG_ERRQUEUE)
-		return ip_recv_error(sk, msg, len);
+		return ip_recv_error(sk, msg, len, addr_len);
 
 try_again:
 	skb = __skb_recv_datagram(sk, flags | (noblock ? MSG_DONTWAIT : 0),
@@ -1274,6 +1312,7 @@ try_again:
 		sin->sin_port = udp_hdr(skb)->source;
 		sin->sin_addr.s_addr = ip_hdr(skb)->saddr;
 		memset(sin->sin_zero, 0, sizeof(sin->sin_zero));
+		*addr_len = sizeof(*sin);
 	}
 	if (inet->cmsg_flags)
 		ip_cmsg_recv(msg, skb);

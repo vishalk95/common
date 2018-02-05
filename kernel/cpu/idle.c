@@ -5,6 +5,9 @@
 #include <linux/cpu.h>
 #include <linux/tick.h>
 #include <linux/mm.h>
+#ifdef CONFIG_MT_LOAD_BALANCE_PROFILER
+#include <mtlbprof/mtlbprof.h>
+#endif
 #include <linux/stackprotector.h>
 
 #include <asm/tlb.h>
@@ -44,7 +47,7 @@ static inline int cpu_idle_poll(void)
 	rcu_idle_enter();
 	trace_cpu_idle_rcuidle(0, smp_processor_id());
 	local_irq_enable();
-	while (!need_resched())
+	while (!tif_need_resched())
 		cpu_relax();
 	trace_cpu_idle_rcuidle(PWR_EVENT_EXIT, smp_processor_id());
 	rcu_idle_exit();
@@ -67,6 +70,10 @@ void __weak arch_cpu_idle(void)
  */
 static void cpu_idle_loop(void)
 {
+#ifdef CONFIG_MT_LOAD_BALANCE_PROFILER
+	mt_lbprof_update_state(smp_processor_id(), MT_LBPROF_NO_TASK_STATE);
+#endif
+
 	while (1) {
 		tick_nohz_idle_enter();
 
@@ -74,8 +81,14 @@ static void cpu_idle_loop(void)
 			check_pgt_cache();
 			rmb();
 
-			if (cpu_is_offline(smp_processor_id()))
+			if (cpu_is_offline(smp_processor_id())) {
+				tick_set_cpu_plugoff_flag(1);
 				arch_cpu_idle_dead();
+			}
+
+#ifdef CONFIG_MT_LOAD_BALANCE_PROFILER
+			mt_lbprof_update_state(smp_processor_id(), MT_LBPROF_IDLE_STATE);
+#endif
 
 			local_irq_disable();
 			arch_cpu_idle_enter();
@@ -92,18 +105,20 @@ static void cpu_idle_loop(void)
 			if (cpu_idle_force_poll || tick_check_broadcast_expired()) {
 				cpu_idle_poll();
 			} else {
-				current_clr_polling();
-				if (!need_resched()) {
+				if (!current_clr_polling_and_test()) {
 					stop_critical_timings();
 					rcu_idle_enter();
 					arch_cpu_idle();
 					WARN_ON_ONCE(irqs_disabled());
 					rcu_idle_exit();
 					start_critical_timings();
+#ifdef CONFIG_MT_LOAD_BALANCE_PROFILER				
+					mt_lbprof_update_state(smp_processor_id(), MT_LBPROF_NO_TASK_STATE);
+#endif				
 				} else {
 					local_irq_enable();
 				}
-				current_set_polling();
+				__current_set_polling();
 			}
 			arch_cpu_idle_exit();
 		}
@@ -129,7 +144,7 @@ void cpu_startup_entry(enum cpuhp_state state)
 	 */
 	boot_init_stack_canary();
 #endif
-	current_set_polling();
+	__current_set_polling();
 	arch_cpu_idle_prepare();
 	cpu_idle_loop();
 }

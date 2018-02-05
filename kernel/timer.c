@@ -49,6 +49,8 @@
 #include <asm/timex.h>
 #include <asm/io.h>
 
+#include "mt_sched_mon.h"
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/timer.h>
 
@@ -149,9 +151,11 @@ static unsigned long round_jiffies_common(unsigned long j, int cpu,
 	/* now that we have rounded, subtract the extra skew again */
 	j -= cpu * 3;
 
-	if (j <= jiffies) /* rounding ate our timeout entirely; */
-		return original;
-	return j;
+	/*
+	 * Make sure j is still in the future. Otherwise return the
+	 * unmodified value.
+	 */
+	return time_is_after_jiffies(j) ? j : original;
 }
 
 /**
@@ -657,6 +661,13 @@ static inline void detach_timer(struct timer_list *timer, bool clear_pending)
 
 	debug_deactivate(timer);
 
+	/***********************MTK debug log for ALPS01821512/ALPS01848462**************************/
+	if((entry->prev == NULL) || (entry->next == NULL))
+	{
+		printk(KERN_EMERG "MTK debug for detach_timer with next=MULL, timer=%p, timer->function=%p\n", timer, timer->function);
+		BUG();
+	}
+		
 	__list_del(entry->prev, entry->next);
 	if (clear_pending)
 		entry->next = NULL;
@@ -820,7 +831,7 @@ unsigned long apply_slack(struct timer_list *timer, unsigned long expires)
 
 	bit = find_last_bit(&mask, BITS_PER_LONG);
 
-	mask = (1 << bit) - 1;
+	mask = (1UL << bit) - 1;
 
 	expires_limit = expires_limit & ~(mask);
 
@@ -1112,7 +1123,9 @@ static void call_timer_fn(struct timer_list *timer, void (*fn)(unsigned long),
 	lock_map_acquire(&lockdep_map);
 
 	trace_timer_expire_entry(timer);
+    mt_trace_sft_start(fn);
 	fn(data);
+    mt_trace_sft_end(fn);
 	trace_timer_expire_exit(timer);
 
 	lock_map_release(&lockdep_map);

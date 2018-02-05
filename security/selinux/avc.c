@@ -743,6 +743,20 @@ static void avc_audit_post_callback(struct audit_buffer *ab, void *a)
 	if (ad->selinux_audit_data->denied) {
 		audit_log_format(ab, " permissive=%u",
 				 ad->selinux_audit_data->result ? 0 : 1);
+#ifdef CONFIG_MTK_SELINUX_AEE_WARNING
+		{
+			struct nlmsghdr *nlh;
+			char *selinux_data;
+			if (ab) {
+				nlh = nlmsg_hdr(audit_get_skb(ab));
+				selinux_data = nlmsg_data(nlh);
+				if (nlh->nlmsg_type != AUDIT_EOE) {
+					if (nlh->nlmsg_type == 1400)
+						mtk_audit_hook(selinux_data);
+				}
+			}
+		}
+#endif
 	}
 }
 
@@ -993,9 +1007,9 @@ static noinline struct avc_node *avc_compute_av(u32 ssid, u32 tsid,
 }
 
 static noinline int avc_denied(u32 ssid, u32 tsid,
-				u16 tclass, u32 requested,
+			 u16 tclass, u32 requested,
 				u16 cmd, unsigned flags,
-				struct av_decision *avd)
+			 struct av_decision *avd)
 {
 	if (flags & AVC_STRICT)
 		return -EACCES;

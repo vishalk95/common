@@ -469,11 +469,11 @@ int avtab_read_item(struct avtab *a, void *fp, struct policydb *pol,
 
 	if ((vers < POLICYDB_VERSION_IOCTL_OPERATIONS)
 			|| !(key.specified & AVTAB_OP)) {
-		rc = next_entry(buf32, fp, sizeof(u32));
-		if (rc) {
-			printk(KERN_ERR "SELinux: avtab: truncated entry\n");
-			return rc;
-		}
+	rc = next_entry(buf32, fp, sizeof(u32));
+	if (rc) {
+		printk(KERN_ERR "SELinux: avtab: truncated entry\n");
+		return rc;
+	}
 		datum.u.data = le32_to_cpu(*buf32);
 	} else {
 		memset(&ops, 0, sizeof(struct avtab_operation));
@@ -574,7 +574,7 @@ int avtab_write_item(struct policydb *p, struct avtab_node *cur, void *fp)
 				ARRAY_SIZE(cur->datum.u.ops->op.perms), fp);
 	} else {
 		buf32[0] = cpu_to_le32(cur->datum.u.data);
-		rc = put_entry(buf32, sizeof(u32), 1, fp);
+	rc = put_entry(buf32, sizeof(u32), 1, fp);
 	}
 	if (rc)
 		return rc;

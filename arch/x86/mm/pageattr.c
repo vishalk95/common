@@ -389,7 +389,7 @@ phys_addr_t slow_virt_to_phys(void *__virt_addr)
 	psize = page_level_size(level);
 	pmask = page_level_mask(level);
 	offset = virt_addr & ~pmask;
-	phys_addr = pte_pfn(*pte) << PAGE_SHIFT;
+	phys_addr = (phys_addr_t)pte_pfn(*pte) << PAGE_SHIFT;
 	return (phys_addr | offset);
 }
 EXPORT_SYMBOL_GPL(slow_virt_to_phys);
@@ -1416,6 +1416,8 @@ void kernel_map_pages(struct page *page, int numpages, int enable)
 	arch_flush_lazy_mmu_mode();
 }
 
+EXPORT_SYMBOL_GPL(kernel_map_pages);
+
 #ifdef CONFIG_HIBERNATION
 
 bool kernel_page_present(struct page *page)
@@ -1429,7 +1431,7 @@ bool kernel_page_present(struct page *page)
 	pte = lookup_address((unsigned long)page_address(page), &level);
 	return (pte_val(*pte) & _PAGE_PRESENT);
 }
-
+EXPORT_SYMBOL_GPL(kernel_page_present);
 #endif /* CONFIG_HIBERNATION */
 
 #endif /* CONFIG_DEBUG_PAGEALLOC */

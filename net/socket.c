@@ -97,6 +97,7 @@
 #include <net/cls_cgroup.h>
 
 #include <net/sock.h>
+#include <net/inet_sock.h>
 #include <linux/netfilter.h>
 
 #include <linux/if_tun.h>
@@ -215,12 +216,13 @@ static int move_addr_to_user(struct sockaddr_storage *kaddr, int klen,
 	int err;
 	int len;
 
+	BUG_ON(klen > sizeof(struct sockaddr_storage));
 	err = get_user(len, ulen);
 	if (err)
 		return err;
 	if (len > klen)
 		len = klen;
-	if (len < 0 || len > sizeof(struct sockaddr_storage))
+	if (len < 0)
 		return -EINVAL;
 	if (len) {
 		if (audit_sockaddr(klen, kaddr))
@@ -586,7 +588,7 @@ void sock_release(struct socket *sock)
 	}
 
 	if (rcu_dereference_protected(sock->wq, 1)->fasync_list)
-		printk(KERN_ERR "sock_release: fasync list not empty!\n");
+		pr_debug("[mtk_net][socket]sock_release: fasync list not empty!\n");
 
 	if (test_bit(SOCK_EXTERNALLY_ALLOCATED, &sock->flags))
 		return;
@@ -1160,6 +1162,26 @@ static int sock_mmap(struct file *file, struct vm_area_struct *vma)
 
 static int sock_close(struct inode *inode, struct file *filp)
 {
+	/*
+	 *      It was possible the inode is NULL we were
+	 *      closing an unfinished socket.
+	 */
+
+	if (!inode) {
+		#ifdef CONFIG_MTK_NET_LOGGING
+		pr_debug(KERN_DEBUG "[mtk_net][socket]sock_close: NULL inode\n");
+		#endif
+		return 0;
+	}
+	#ifdef CONFIG_MTK_NET_LOGGING
+        struct socket *sock = SOCKET_I(inode);
+
+	if ((sock != NULL) && (sock->sk != NULL)) {
+			pr_debug(KERN_INFO "[mtk_net][socekt]socket_close[%lu] refcnt: %d\n",
+				inode->i_ino, atomic_read(&sock->sk->sk_refcnt));
+	} else
+		pr_debug(KERN_INFO "[mtk_net][socekt]socket_close[%lu]\n", inode->i_ino);
+	#endif
 	sock_release(SOCKET_I(inode));
 	return 0;
 }
@@ -1256,8 +1278,10 @@ int __sock_create(struct net *net, int family, int type, int protocol,
 		static int warned;
 		if (!warned) {
 			warned = 1;
-			printk(KERN_INFO "%s uses obsolete (PF_INET,SOCK_PACKET)\n",
+			#ifdef CONFIG_MTK_NET_LOGGING
+			pr_debug("[mtk_net][socket]%s uses obsolete (PF_INET,SOCK_PACKET)\n",
 			       current->comm);
+			#endif
 		}
 		family = PF_PACKET;
 	}
@@ -1387,6 +1411,13 @@ SYSCALL_DEFINE3(socket, int, family, int, type, int, protocol)
 
 out:
 	/* It may be already another descriptor 8) Not kernel problem. */
+
+ #ifdef CONFIG_MTK_NET_LOGGING
+	if ((retval >= 0) && sock && SOCK_INODE(sock))
+		pr_debug("[mtk_net][socket]socket_create[%lu]:fd=%d\n", SOCK_INODE(sock)->i_ino, retval);
+	 else
+		pr_debug("[mtk_net][socket]socket_create:fd=%d\n", retval);
+#endif
 	return retval;
 
 out_release:
@@ -1397,7 +1428,6 @@ out_release:
 /*
  *	Create a pair of connected sockets.
  */
-
 SYSCALL_DEFINE4(socketpair, int, family, int, type, int, protocol,
 		int __user *, usockvec)
 {
@@ -1472,10 +1502,20 @@ SYSCALL_DEFINE4(socketpair, int, family, int, type, int, protocol,
 	if (!err)
 		err = put_user(fd2, &usockvec[1]);
 	if (!err)
+        {
+		if (sock1 && SOCK_INODE(sock1) && sock2 && SOCK_INODE(sock2)) {
+			#ifdef CONFIG_MTK_NET_LOGGING
+			pr_debug(KERN_INFO "[mtk_net][socket]socketpair:fd1[%lu]=%d, fd2[%lu]=%d\n",
+				SOCK_INODE(sock1)->i_ino, fd1, SOCK_INODE(sock2)->i_ino, fd2);
+			#endif
+		}
 		return 0;
-
+        }
 	sys_close(fd2);
 	sys_close(fd1);
+	#ifdef CONFIG_MTK_NET_LOGGING
+	pr_debug(KERN_INFO "[mtk_net][socket]socketpair fail1: %d\n", err);
+	#endif
 	return err;
 
 out_release_both:
@@ -1483,6 +1523,9 @@ out_release_both:
 out_release_1:
 	sock_release(sock1);
 out:
+	#ifdef CONFIG_MTK_NET_LOGGING
+	pr_debug("[mtk_net][socket]socketpair fail2: %d\n", err);
+    #endif
 	return err;
 }
 
@@ -1503,6 +1546,7 @@ SYSCALL_DEFINE3(bind, int, fd, struct sockaddr __user *, umyaddr, int, addrlen)
 	sock = sockfd_lookup_light(fd, &err, &fput_needed);
 	if (sock) {
 		err = move_addr_to_kernel(umyaddr, addrlen, &address);
+
 		if (err >= 0) {
 			err = security_socket_bind(sock,
 						   (struct sockaddr *)&address,
@@ -1511,6 +1555,11 @@ SYSCALL_DEFINE3(bind, int, fd, struct sockaddr __user *, umyaddr, int, addrlen)
 				err = sock->ops->bind(sock,
 						      (struct sockaddr *)
 						      &address, addrlen);
+			#ifdef CONFIG_MTK_NET_LOGGING
+				if ((((struct sockaddr_in *)&address)->sin_family) != AF_UNIX)
+					pr_debug("[mtk_net][socket] bind addr->sin_port:%d,err:%d\n",
+					htons(((struct sockaddr_in *)&address)->sin_port), err);
+			#endif
 		}
 		fput_light(sock->file, fput_needed);
 	}
@@ -1555,11 +1604,11 @@ SYSCALL_DEFINE2(listen, int, fd, int, backlog)
  *	status to recvmsg. We need to add that support in a way thats
  *	clean when we restucture accept also.
  */
-
 SYSCALL_DEFINE4(accept4, int, fd, struct sockaddr __user *, upeer_sockaddr,
 		int __user *, upeer_addrlen, int, flags)
 {
-	struct socket *sock, *newsock;
+	struct socket *sock;
+	struct socket *newsock = NULL;
 	struct file *newfile;
 	int err, len, newfd, fput_needed;
 	struct sockaddr_storage address;
@@ -1630,6 +1679,13 @@ SYSCALL_DEFINE4(accept4, int, fd, struct sockaddr __user *, upeer_sockaddr,
 out_put:
 	fput_light(sock->file, fput_needed);
 out:
+	if ((err >= 0) && newsock && SOCK_INODE(newsock)) {
+		#ifdef CONFIG_MTK_NET_LOGGING
+		pr_debug("[mtk_net][socket]socket_accept:fd=%d,server_sock[%lu], newsock[%lu]\n",
+			 err, SOCK_INODE(sock)->i_ino, SOCK_INODE(newsock)->i_ino);
+		#endif
+	    }
+
 	return err;
 out_fd:
 	fput(newfile);
@@ -1832,8 +1888,10 @@ SYSCALL_DEFINE6(recvfrom, int, fd, void __user *, ubuf, size_t, size,
 	msg.msg_iov = &iov;
 	iov.iov_len = size;
 	iov.iov_base = ubuf;
-	msg.msg_name = (struct sockaddr *)&address;
-	msg.msg_namelen = sizeof(address);
+	/* Save some cycles and don't copy the address if not needed */
+	msg.msg_name = addr ? (struct sockaddr *)&address : NULL;
+	/* We assume all kernel code knows the size of sockaddr_storage */
+	msg.msg_namelen = 0;
 	if (sock->file->f_flags & O_NONBLOCK)
 		flags |= MSG_DONTWAIT;
 	err = sock_recvmsg(sock, &msg, size, flags);
@@ -1956,6 +2014,20 @@ struct used_address {
 	unsigned int name_len;
 };
 
+static int copy_msghdr_from_user(struct msghdr *kmsg,
+				 struct msghdr __user *umsg)
+{
+	if (copy_from_user(kmsg, umsg, sizeof(struct msghdr)))
+		return -EFAULT;
+
+	if (kmsg->msg_namelen < 0)
+		return -EINVAL;
+
+	if (kmsg->msg_namelen > sizeof(struct sockaddr_storage))
+		kmsg->msg_namelen = sizeof(struct sockaddr_storage);
+	return 0;
+}
+
 static int ___sys_sendmsg(struct socket *sock, struct msghdr __user *msg,
 			 struct msghdr *msg_sys, unsigned int flags,
 			 struct used_address *used_address)
@@ -1974,8 +2046,11 @@ static int ___sys_sendmsg(struct socket *sock, struct msghdr __user *msg,
 	if (MSG_CMSG_COMPAT & flags) {
 		if (get_compat_msghdr(msg_sys, msg_compat))
 			return -EFAULT;
-	} else if (copy_from_user(msg_sys, msg, sizeof(struct msghdr)))
-		return -EFAULT;
+	} else {
+		err = copy_msghdr_from_user(msg_sys, msg);
+		if (err)
+			return err;
+	}
 
 	if (msg_sys->msg_iovlen > UIO_FASTIOV) {
 		err = -EMSGSIZE;
@@ -2183,8 +2258,11 @@ static int ___sys_recvmsg(struct socket *sock, struct msghdr __user *msg,
 	if (MSG_CMSG_COMPAT & flags) {
 		if (get_compat_msghdr(msg_sys, msg_compat))
 			return -EFAULT;
-	} else if (copy_from_user(msg_sys, msg, sizeof(struct msghdr)))
-		return -EFAULT;
+	} else {
+		err = copy_msghdr_from_user(msg_sys, msg);
+		if (err)
+			return err;
+	}
 
 	if (msg_sys->msg_iovlen > UIO_FASTIOV) {
 		err = -EMSGSIZE;
@@ -2197,16 +2275,14 @@ static int ___sys_recvmsg(struct socket *sock, struct msghdr __user *msg,
 			goto out;
 	}
 
-	/*
-	 *      Save the user-mode address (verify_iovec will change the
-	 *      kernel msghdr to use the kernel address space)
+	/* Save the user-mode address (verify_iovec will change the
+	 * kernel msghdr to use the kernel address space)
 	 */
-
 	uaddr = (__force void __user *)msg_sys->msg_name;
 	uaddr_len = COMPAT_NAMELEN(msg);
-	if (MSG_CMSG_COMPAT & flags) {
+	if (MSG_CMSG_COMPAT & flags)
 		err = verify_compat_iovec(msg_sys, iov, &addr, VERIFY_WRITE);
-	} else
+	else
 		err = verify_iovec(msg_sys, iov, &addr, VERIFY_WRITE);
 	if (err < 0)
 		goto out_freeiov;
@@ -2214,6 +2290,9 @@ static int ___sys_recvmsg(struct socket *sock, struct msghdr __user *msg,
 
 	cmsg_ptr = (unsigned long)msg_sys->msg_control;
 	msg_sys->msg_flags = flags & (MSG_CMSG_CLOEXEC|MSG_CMSG_COMPAT);
+
+	/* We assume all kernel code knows the size of sockaddr_storage */
+	msg_sys->msg_namelen = 0;
 
 	if (sock->file->f_flags & O_NONBLOCK)
 		flags |= MSG_DONTWAIT;
@@ -2554,7 +2633,7 @@ int sock_register(const struct net_proto_family *ops)
 	int err;
 
 	if (ops->family >= NPROTO) {
-		printk(KERN_CRIT "protocol %d >= NPROTO(%d)\n", ops->family,
+		pr_debug(KERN_CRIT "[mtk_net][sock]protocol %d >= NPROTO(%d)\n", ops->family,
 		       NPROTO);
 		return -ENOBUFS;
 	}
@@ -2568,8 +2647,9 @@ int sock_register(const struct net_proto_family *ops)
 		err = 0;
 	}
 	spin_unlock(&net_family_lock);
-
-	printk(KERN_INFO "NET: Registered protocol family %d\n", ops->family);
+    #ifdef CONFIG_MTK_NET_LOGGING
+	pr_debug("[mtk_net][socekt]NET: Registered protocol family %d\n", ops->family);
+	#endif
 	return err;
 }
 EXPORT_SYMBOL(sock_register);
@@ -2596,8 +2676,9 @@ void sock_unregister(int family)
 	spin_unlock(&net_family_lock);
 
 	synchronize_rcu();
-
-	printk(KERN_INFO "NET: Unregistered protocol family %d\n", family);
+    #ifdef CONFIG_MTK_NET_LOGGING
+	pr_debug("[mtk_net][socket]NET: Unregistered protocol family %d\n", family);
+	#endif
 }
 EXPORT_SYMBOL(sock_unregister);
 

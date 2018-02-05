@@ -1,3 +1,5 @@
+#define DEBUG 1
+
 /*
  * Generic ring buffer
  *
@@ -26,6 +28,10 @@
 #include <linux/fs.h>
 
 #include <asm/local.h>
+
+#ifdef CONFIG_MTK_EXTMEM
+#include <linux/exm_driver.h>
+#endif
 
 static void update_pages_handler(struct work_struct *work);
 
@@ -295,7 +301,7 @@ unsigned ring_buffer_event_length(struct ring_buffer_event *event)
 		return length;
 	length -= RB_EVNT_HDR_SIZE;
 	if (length > RB_MAX_SMALL_DATA + sizeof(event->array[0]))
-                length -= sizeof(event->array[0]);
+		length -= sizeof(event->array[0]);
 	return length;
 }
 EXPORT_SYMBOL_GPL(ring_buffer_event_length);
@@ -397,7 +403,11 @@ size_t ring_buffer_page_len(void *page)
  */
 static void free_buffer_page(struct buffer_page *bpage)
 {
+#ifdef CONFIG_MTK_EXTMEM
+	extmem_free((void *)bpage->page);
+#else
 	free_page((unsigned long)bpage->page);
+#endif
 	kfree(bpage);
 }
 
@@ -543,7 +553,7 @@ static void rb_wake_up_waiters(struct irq_work *work)
  * as data is added to any of the @buffer's cpu buffers. Otherwise
  * it will wait for data to be added to a specific cpu buffer.
  */
-void ring_buffer_wait(struct ring_buffer *buffer, int cpu)
+int ring_buffer_wait(struct ring_buffer *buffer, int cpu)
 {
 	struct ring_buffer_per_cpu *cpu_buffer;
 	DEFINE_WAIT(wait);
@@ -557,6 +567,8 @@ void ring_buffer_wait(struct ring_buffer *buffer, int cpu)
 	if (cpu == RING_BUFFER_ALL_CPUS)
 		work = &buffer->irq_work;
 	else {
+		if (!cpumask_test_cpu(cpu, buffer->cpumask))
+			return -ENODEV;
 		cpu_buffer = buffer->buffers[cpu];
 		work = &cpu_buffer->irq_work;
 	}
@@ -591,6 +603,7 @@ void ring_buffer_wait(struct ring_buffer *buffer, int cpu)
 		schedule();
 
 	finish_wait(&work->waiters, &wait);
+	return 0;
 }
 
 /**
@@ -613,10 +626,6 @@ int ring_buffer_poll_wait(struct ring_buffer *buffer, int cpu,
 	struct ring_buffer_per_cpu *cpu_buffer;
 	struct rb_irq_work *work;
 
-	if ((cpu == RING_BUFFER_ALL_CPUS && !ring_buffer_empty(buffer)) ||
-	    (cpu != RING_BUFFER_ALL_CPUS && !ring_buffer_empty_cpu(buffer, cpu)))
-		return POLLIN | POLLRDNORM;
-
 	if (cpu == RING_BUFFER_ALL_CPUS)
 		work = &buffer->irq_work;
 	else {
@@ -627,8 +636,22 @@ int ring_buffer_poll_wait(struct ring_buffer *buffer, int cpu,
 		work = &cpu_buffer->irq_work;
 	}
 
-	work->waiters_pending = true;
 	poll_wait(filp, &work->waiters, poll_table);
+	work->waiters_pending = true;
+	/*
+	 * There's a tight race between setting the waiters_pending and
+	 * checking if the ring buffer is empty.  Once the waiters_pending bit
+	 * is set, the next event will wake the task up, but we can get stuck
+	 * if there's only a single event in.
+	 *
+	 * FIXME: Ideally, we need a memory barrier on the writer side as well,
+	 * but adding a memory barrier to all events will cause too much of a
+	 * performance hit in the fast path.  We only need a memory barrier when
+	 * the buffer goes from empty to having content.  But as this race is
+	 * extremely small, and it's not a problem if another event comes in, we
+	 * will fix it later.
+	 */
+	smp_mb();
 
 	if ((cpu == RING_BUFFER_ALL_CPUS && !ring_buffer_empty(buffer)) ||
 	    (cpu != RING_BUFFER_ALL_CPUS && !ring_buffer_empty_cpu(buffer, cpu)))
@@ -1113,7 +1136,9 @@ static int __rb_allocate_pages(int nr_pages, struct list_head *pages, int cpu)
 	struct buffer_page *bpage, *tmp;
 
 	for (i = 0; i < nr_pages; i++) {
+#if !defined(CONFIG_MTK_EXTMEM)
 		struct page *page;
+#endif
 		/*
 		 * __GFP_NORETRY flag makes sure that the allocation fails
 		 * gracefully without invoking oom-killer and the system is
@@ -1127,11 +1152,19 @@ static int __rb_allocate_pages(int nr_pages, struct list_head *pages, int cpu)
 
 		list_add(&bpage->list, pages);
 
+#ifdef CONFIG_MTK_EXTMEM
+		bpage->page = extmem_malloc_page_align(PAGE_SIZE);
+		if (bpage->page == NULL) {
+			pr_err("%s[%s] ext memory alloc failed!!!\n", __FILE__, __func__);
+			goto free_pages;
+		}
+#else
 		page = alloc_pages_node(cpu_to_node(cpu),
 					GFP_KERNEL | __GFP_NORETRY, 0);
 		if (!page)
 			goto free_pages;
 		bpage->page = page_address(page);
+#endif
 		rb_init_page(bpage->page);
 	}
 
@@ -1176,7 +1209,9 @@ rb_allocate_cpu_buffer(struct ring_buffer *buffer, int nr_pages, int cpu)
 {
 	struct ring_buffer_per_cpu *cpu_buffer;
 	struct buffer_page *bpage;
+#if !defined(CONFIG_MTK_EXTMEM)
 	struct page *page;
+#endif
 	int ret;
 
 	cpu_buffer = kzalloc_node(ALIGN(sizeof(*cpu_buffer), cache_line_size()),
@@ -1202,10 +1237,17 @@ rb_allocate_cpu_buffer(struct ring_buffer *buffer, int nr_pages, int cpu)
 	rb_check_bpage(cpu_buffer, bpage);
 
 	cpu_buffer->reader_page = bpage;
+
+#ifdef CONFIG_MTK_EXTMEM
+	bpage->page = extmem_malloc_page_align(PAGE_SIZE);
+	if (bpage->page == NULL)
+		goto fail_free_reader;
+#else
 	page = alloc_pages_node(cpu_to_node(cpu), GFP_KERNEL, 0);
 	if (!page)
 		goto fail_free_reader;
 	bpage->page = page_address(page);
+#endif
 	rb_init_page(bpage->page);
 
 	INIT_LIST_HEAD(&cpu_buffer->reader_page->list);
@@ -1981,7 +2023,7 @@ rb_add_time_stamp(struct ring_buffer_event *event, u64 delta)
 
 /**
  * rb_update_event - update event type and data
- * @event: the even to update
+ * @event: the event to update
  * @type: the type of event
  * @length: the size of the event field in the ring buffer
  *
@@ -2395,6 +2437,13 @@ __rb_reserve_next(struct ring_buffer_per_cpu *cpu_buffer,
 	/* set write to only the index of the write */
 	write &= RB_WRITE_MASK;
 	tail = write - length;
+
+	/*
+	 * If this is the first commit on the page, then it has the same
+	 * timestamp as the page itself.
+	 */
+	if (!tail)
+		delta = 0;
 
 	/* See if we shot pass the end of this buffer page */
 	if (unlikely(write > BUF_PAGE_SIZE))
@@ -3347,21 +3396,16 @@ static void rb_iter_reset(struct ring_buffer_iter *iter)
 	struct ring_buffer_per_cpu *cpu_buffer = iter->cpu_buffer;
 
 	/* Iterator usage is expected to have record disabled */
-	if (list_empty(&cpu_buffer->reader_page->list)) {
-		iter->head_page = rb_set_head_page(cpu_buffer);
-		if (unlikely(!iter->head_page))
-			return;
-		iter->head = iter->head_page->read;
-	} else {
-		iter->head_page = cpu_buffer->reader_page;
-		iter->head = cpu_buffer->reader_page->read;
-	}
+	iter->head_page = cpu_buffer->reader_page;
+	iter->head = cpu_buffer->reader_page->read;
+
+	iter->cache_reader_page = iter->head_page;
+	iter->cache_read = cpu_buffer->read;
+
 	if (iter->head)
 		iter->read_stamp = cpu_buffer->read_stamp;
 	else
 		iter->read_stamp = iter->head_page->page->time_stamp;
-	iter->cache_reader_page = cpu_buffer->reader_page;
-	iter->cache_read = cpu_buffer->read;
 }
 
 /**
@@ -3754,12 +3798,14 @@ rb_iter_peek(struct ring_buffer_iter *iter, u64 *ts)
 		return NULL;
 
 	/*
-	 * We repeat when a time extend is encountered.
-	 * Since the time extend is always attached to a data event,
-	 * we should never loop more than once.
-	 * (We never hit the following condition more than twice).
+	 * We repeat when a time extend is encountered or we hit
+	 * the end of the page. Since the time extend is always attached
+	 * to a data event, we should never loop more than three times.
+	 * Once for going to next page, once on time extend, and
+	 * finally once to get the event.
+	 * (We never hit the following condition more than thrice).
 	 */
-	if (RB_WARN_ON(cpu_buffer, ++nr_loops > 2))
+	if (RB_WARN_ON(cpu_buffer, ++nr_loops > 3))
 		return NULL;
 
 	if (rb_per_cpu_empty(cpu_buffer))
@@ -4829,7 +4875,7 @@ static __init int test_ringbuffer(void)
 		}
 
 		kthread_bind(rb_threads[cpu], cpu);
- 		wake_up_process(rb_threads[cpu]);
+		wake_up_process(rb_threads[cpu]);
 	}
 
 	/* Now create the rb hammer! */

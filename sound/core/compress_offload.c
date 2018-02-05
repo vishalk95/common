@@ -38,6 +38,7 @@
 #include <linux/uio.h>
 #include <linux/uaccess.h>
 #include <linux/module.h>
+#include <linux/compat.h>
 #include <sound/core.h>
 #include <sound/initval.h>
 #include <sound/compress_params.h>
@@ -133,7 +134,7 @@ static int snd_compr_open(struct inode *inode, struct file *f)
 		kfree(data);
 	}
 	snd_card_unref(compr->card);
-	return 0;
+	return ret;
 }
 
 static int snd_compr_free(struct inode *inode, struct file *f)
@@ -665,12 +666,46 @@ static int snd_compr_stop(struct snd_compr_stream *stream)
 		return -EPERM;
 	retval = stream->ops->trigger(stream, SNDRV_PCM_TRIGGER_STOP);
 	if (!retval) {
-		stream->runtime->state = SNDRV_PCM_STATE_SETUP;
-		wake_up(&stream->runtime->sleep);
+		snd_compr_drain_notify(stream);
 		stream->runtime->total_bytes_available = 0;
 		stream->runtime->total_bytes_transferred = 0;
 	}
 	return retval;
+}
+
+static int snd_compress_wait_for_drain(struct snd_compr_stream *stream)
+{
+	int ret;
+
+	/*
+	 * We are called with lock held. So drop the lock while we wait for
+	 * drain complete notfication from the driver
+	 *
+	 * It is expected that driver will notify the drain completion and then
+	 * stream will be moved to SETUP state, even if draining resulted in an
+	 * error. We can trigger next track after this.
+	 */
+	stream->runtime->state = SNDRV_PCM_STATE_DRAINING;
+	mutex_unlock(&stream->device->lock);
+
+	/* we wait for drain to complete here, drain can return when
+	 * interruption occurred, wait returned error or success.
+	 * For the first two cases we don't do anything different here and
+	 * return after waking up
+	 */
+
+	ret = wait_event_interruptible(stream->runtime->sleep,
+			(stream->runtime->state != SNDRV_PCM_STATE_DRAINING));
+	if (ret == -ERESTARTSYS)
+		pr_debug("wait aborted by a signal");
+	else if (ret)
+		pr_debug("wait for drain failed with %d\n", ret);
+
+
+	wake_up(&stream->runtime->sleep);
+	mutex_lock(&stream->device->lock);
+
+	return ret;
 }
 
 static int snd_compr_drain(struct snd_compr_stream *stream)
@@ -680,12 +715,15 @@ static int snd_compr_drain(struct snd_compr_stream *stream)
 	if (stream->runtime->state == SNDRV_PCM_STATE_PREPARED ||
 			stream->runtime->state == SNDRV_PCM_STATE_SETUP)
 		return -EPERM;
+
 	retval = stream->ops->trigger(stream, SND_COMPR_TRIGGER_DRAIN);
-	if (!retval) {
-		stream->runtime->state = SNDRV_PCM_STATE_DRAINING;
+	if (retval) {
+		pr_debug("SND_COMPR_TRIGGER_DRAIN failed %d\n", retval);
 		wake_up(&stream->runtime->sleep);
+		return retval;
 	}
-	return retval;
+
+	return snd_compress_wait_for_drain(stream);
 }
 
 static int snd_compr_next_track(struct snd_compr_stream *stream)
@@ -721,9 +759,14 @@ static int snd_compr_partial_drain(struct snd_compr_stream *stream)
 		return -EPERM;
 
 	retval = stream->ops->trigger(stream, SND_COMPR_TRIGGER_PARTIAL_DRAIN);
+	if (retval) {
+		pr_debug("Partial drain returned failure\n");
+		wake_up(&stream->runtime->sleep);
+		return retval;
+	}
 
 	stream->next_track = false;
-	return retval;
+	return snd_compress_wait_for_drain(stream);
 }
 
 static long snd_compr_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
@@ -740,7 +783,7 @@ static long snd_compr_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	mutex_lock(&stream->device->lock);
 	switch (_IOC_NR(cmd)) {
 	case _IOC_NR(SNDRV_COMPRESS_IOCTL_VERSION):
-		put_user(SNDRV_COMPRESS_VERSION,
+		retval = put_user(SNDRV_COMPRESS_VERSION,
 				(int __user *)arg) ? -EFAULT : 0;
 		break;
 	case _IOC_NR(SNDRV_COMPRESS_GET_CAPS):
@@ -794,6 +837,42 @@ static long snd_compr_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	return retval;
 }
 
+
+/*
+ * ioctl32 compat
+ */
+#ifdef CONFIG_COMPAT
+
+static long snd_compr_ioctl_compat(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	switch (_IOC_NR(cmd)) {
+	case _IOC_NR(SNDRV_COMPRESS_IOCTL_VERSION):
+	case _IOC_NR(SNDRV_COMPRESS_GET_CAPS):
+	case _IOC_NR(SNDRV_COMPRESS_GET_CODEC_CAPS):
+	case _IOC_NR(SNDRV_COMPRESS_SET_PARAMS):
+	case _IOC_NR(SNDRV_COMPRESS_GET_PARAMS):
+	case _IOC_NR(SNDRV_COMPRESS_SET_METADATA):
+	case _IOC_NR(SNDRV_COMPRESS_GET_METADATA):
+	case _IOC_NR(SNDRV_COMPRESS_TSTAMP):
+	case _IOC_NR(SNDRV_COMPRESS_AVAIL):
+	case _IOC_NR(SNDRV_COMPRESS_PAUSE):
+	case _IOC_NR(SNDRV_COMPRESS_RESUME):
+	case _IOC_NR(SNDRV_COMPRESS_START):
+	case _IOC_NR(SNDRV_COMPRESS_STOP):
+	case _IOC_NR(SNDRV_COMPRESS_DRAIN):
+	case _IOC_NR(SNDRV_COMPRESS_PARTIAL_DRAIN):
+	case _IOC_NR(SNDRV_COMPRESS_NEXT_TRACK):
+        return file->f_op->unlocked_ioctl(file, cmd,arg);
+		break;
+
+	}
+
+}
+
+#else
+#define snd_compr_ioctl_compat   NULL
+#endif
+
 static const struct file_operations snd_compr_file_ops = {
 		.owner =	THIS_MODULE,
 		.open =		snd_compr_open,
@@ -801,6 +880,7 @@ static const struct file_operations snd_compr_file_ops = {
 		.write =	snd_compr_write,
 		.read =		snd_compr_read,
 		.unlocked_ioctl = snd_compr_ioctl,
+        .compat_ioctl = 	snd_compr_ioctl_compat,
 		.mmap =		snd_compr_mmap,
 		.poll =		snd_compr_poll,
 };
@@ -834,7 +914,8 @@ static int snd_compress_dev_disconnect(struct snd_device *device)
 	struct snd_compr *compr;
 
 	compr = device->device_data;
-	snd_unregister_device(compr->direction, compr->card, compr->device);
+	snd_unregister_device(SNDRV_DEVICE_TYPE_COMPRESS, compr->card,
+		compr->device);
 	return 0;
 }
 

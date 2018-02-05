@@ -80,11 +80,12 @@ static struct vfsmount *shm_mnt;
 #define SHORT_SYMLINK_LEN 128
 
 /*
- * shmem_fallocate and shmem_writepage communicate via inode->i_private
- * (with i_mutex making sure that it has only one user at a time):
- * we would prefer not to enlarge the shmem inode just for that.
+ * shmem_fallocate communicates with shmem_fault or shmem_writepage via
+ * inode->i_private (with i_mutex making sure that it has only one user at
+ * a time): we would prefer not to enlarge the shmem inode just for that.
  */
 struct shmem_falloc {
+	wait_queue_head_t *waitq; /* faults into hole wait for punch to end */
 	pgoff_t start;		/* start of range currently being fallocated */
 	pgoff_t next;		/* the next page offset to be fallocated */
 	pgoff_t nr_falloced;	/* how many new pages have been fallocated */
@@ -533,21 +534,18 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
 		return;
 
 	index = start;
-	for ( ; ; ) {
+	while (index < end) {
 		cond_resched();
 		pvec.nr = shmem_find_get_pages_and_swap(mapping, index,
 				min(end - index, (pgoff_t)PAGEVEC_SIZE),
 							pvec.pages, indices);
 		if (!pvec.nr) {
-			if (index == start || unfalloc)
+			/* If all gone or hole-punch or unfalloc, we're done */
+			if (index == start || end != -1)
 				break;
+			/* But if truncating, restart to make sure all gone */
 			index = start;
 			continue;
-		}
-		if ((index == start || unfalloc) && indices[0] >= end) {
-			shmem_deswap_pagevec(&pvec);
-			pagevec_release(&pvec);
-			break;
 		}
 		mem_cgroup_uncharge_start();
 		for (i = 0; i < pagevec_count(&pvec); i++) {
@@ -560,8 +558,12 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
 			if (radix_tree_exceptional_entry(page)) {
 				if (unfalloc)
 					continue;
-				nr_swaps_freed += !shmem_free_swap(mapping,
-								index, page);
+				if (shmem_free_swap(mapping, index, page)) {
+					/* Swap was replaced by page: retry */
+					index--;
+					break;
+				}
+				nr_swaps_freed++;
 				continue;
 			}
 
@@ -570,6 +572,11 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
 				if (page->mapping == mapping) {
 					VM_BUG_ON(PageWriteback(page));
 					truncate_inode_page(mapping, page);
+				} else {
+					/* Page was replaced by swap: retry */
+					unlock_page(page);
+					index--;
+					break;
 				}
 			}
 			unlock_page(page);
@@ -826,6 +833,7 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 			spin_lock(&inode->i_lock);
 			shmem_falloc = inode->i_private;
 			if (shmem_falloc &&
+			    !shmem_falloc->waitq &&
 			    index >= shmem_falloc->start &&
 			    index < shmem_falloc->next)
 				shmem_falloc->nr_unswapped++;
@@ -840,7 +848,11 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 		SetPageUptodate(page);
 	}
 
+#ifndef CONFIG_MEMCG_ZNDSWAP
 	swap = get_swap_page();
+#else
+	swap = get_swap_page_by_memcg(page);
+#endif
 	if (!swap.val)
 		goto redirty;
 
@@ -1300,6 +1312,64 @@ static int shmem_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 	int error;
 	int ret = VM_FAULT_LOCKED;
 
+	/*
+	 * Trinity finds that probing a hole which tmpfs is punching can
+	 * prevent the hole-punch from ever completing: which in turn
+	 * locks writers out with its hold on i_mutex.  So refrain from
+	 * faulting pages into the hole while it's being punched.  Although
+	 * shmem_undo_range() does remove the additions, it may be unable to
+	 * keep up, as each new page needs its own unmap_mapping_range() call,
+	 * and the i_mmap tree grows ever slower to scan if new vmas are added.
+	 *
+	 * It does not matter if we sometimes reach this check just before the
+	 * hole-punch begins, so that one fault then races with the punch:
+	 * we just need to make racing faults a rare case.
+	 *
+	 * The implementation below would be much simpler if we just used a
+	 * standard mutex or completion: but we cannot take i_mutex in fault,
+	 * and bloating every shmem inode for this unlikely case would be sad.
+	 */
+	if (unlikely(inode->i_private)) {
+		struct shmem_falloc *shmem_falloc;
+
+		spin_lock(&inode->i_lock);
+		shmem_falloc = inode->i_private;
+		if (shmem_falloc &&
+		    shmem_falloc->waitq &&
+		    vmf->pgoff >= shmem_falloc->start &&
+		    vmf->pgoff < shmem_falloc->next) {
+			wait_queue_head_t *shmem_falloc_waitq;
+			DEFINE_WAIT(shmem_fault_wait);
+
+			ret = VM_FAULT_NOPAGE;
+			if ((vmf->flags & FAULT_FLAG_ALLOW_RETRY) &&
+			   !(vmf->flags & FAULT_FLAG_RETRY_NOWAIT)) {
+				/* It's polite to up mmap_sem if we can */
+				up_read(&vma->vm_mm->mmap_sem);
+				ret = VM_FAULT_RETRY;
+			}
+
+			shmem_falloc_waitq = shmem_falloc->waitq;
+			prepare_to_wait(shmem_falloc_waitq, &shmem_fault_wait,
+					TASK_UNINTERRUPTIBLE);
+			spin_unlock(&inode->i_lock);
+			schedule();
+
+			/*
+			 * shmem_falloc_waitq points into the shmem_fallocate()
+			 * stack of the hole-punching task: shmem_falloc_waitq
+			 * is usually invalid by the time we reach here, but
+			 * finish_wait() does not dereference it in that case;
+			 * though i_lock needed lest racing with wake_up_all().
+			 */
+			spin_lock(&inode->i_lock);
+			finish_wait(shmem_falloc_waitq, &shmem_fault_wait);
+			spin_unlock(&inode->i_lock);
+			return ret;
+		}
+		spin_unlock(&inode->i_lock);
+	}
+
 	error = shmem_getpage(inode, vmf->pgoff, &vmf->page, SGP_CACHE, &ret);
 	if (error)
 		return ((error == -ENOMEM) ? VM_FAULT_OOM : VM_FAULT_SIGBUS);
@@ -1362,7 +1432,7 @@ static int shmem_mmap(struct file *file, struct vm_area_struct *vma)
 }
 
 static struct inode *shmem_get_inode(struct super_block *sb, const struct inode *dir,
-				     umode_t mode, dev_t dev, unsigned long flags)
+				     umode_t mode, dev_t dev, unsigned long flags, int atomic_copy)
 {
 	struct inode *inode;
 	struct shmem_inode_info *info;
@@ -1373,6 +1443,8 @@ static struct inode *shmem_get_inode(struct super_block *sb, const struct inode 
 
 	inode = new_inode(sb);
 	if (inode) {
+		/* We don't let shmem use __GFP_SLOWHIGHMEM */
+		mapping_set_gfp_mask(inode->i_mapping, GFP_HIGHUSER_MOVABLE);
 		inode->i_ino = get_next_ino();
 		inode_init_owner(inode, dir, mode);
 		inode->i_blocks = 0;
@@ -1383,6 +1455,8 @@ static struct inode *shmem_get_inode(struct super_block *sb, const struct inode 
 		memset(info, 0, (char *)inode - (char *)info);
 		spin_lock_init(&info->lock);
 		info->flags = flags & VM_NORESERVE;
+		if (atomic_copy)
+			inode->i_flags |= S_ATOMIC_COPY;
 		INIT_LIST_HEAD(&info->swaplist);
 		simple_xattrs_init(&info->xattrs);
 		cache_no_acl(inode);
@@ -1815,18 +1889,33 @@ static long shmem_fallocate(struct file *file, int mode, loff_t offset,
 	pgoff_t start, index, end;
 	int error;
 
-	mutex_lock(&inode->i_mutex);
+	//To avoid nested lock
+	if (!mutex_trylock(&inode->i_mutex))
+		return -1;
 
 	if (mode & FALLOC_FL_PUNCH_HOLE) {
 		struct address_space *mapping = file->f_mapping;
 		loff_t unmap_start = round_up(offset, PAGE_SIZE);
 		loff_t unmap_end = round_down(offset + len, PAGE_SIZE) - 1;
+		DECLARE_WAIT_QUEUE_HEAD_ONSTACK(shmem_falloc_waitq);
+
+		shmem_falloc.waitq = &shmem_falloc_waitq;
+		shmem_falloc.start = unmap_start >> PAGE_SHIFT;
+		shmem_falloc.next = (unmap_end + 1) >> PAGE_SHIFT;
+		spin_lock(&inode->i_lock);
+		inode->i_private = &shmem_falloc;
+		spin_unlock(&inode->i_lock);
 
 		if ((u64)unmap_end > (u64)unmap_start)
 			unmap_mapping_range(mapping, unmap_start,
 					    1 + unmap_end - unmap_start, 0);
 		shmem_truncate_range(inode, offset, offset + len - 1);
 		/* No need to unmap again: hole-punching leaves COWed pages */
+
+		spin_lock(&inode->i_lock);
+		inode->i_private = NULL;
+		wake_up_all(&shmem_falloc_waitq);
+		spin_unlock(&inode->i_lock);
 		error = 0;
 		goto out;
 	}
@@ -1844,6 +1933,7 @@ static long shmem_fallocate(struct file *file, int mode, loff_t offset,
 		goto out;
 	}
 
+	shmem_falloc.waitq = NULL;
 	shmem_falloc.start = start;
 	shmem_falloc.next  = start;
 	shmem_falloc.nr_falloced = 0;
@@ -1937,7 +2027,7 @@ shmem_mknod(struct inode *dir, struct dentry *dentry, umode_t mode, dev_t dev)
 	struct inode *inode;
 	int error = -ENOSPC;
 
-	inode = shmem_get_inode(dir->i_sb, dir, mode, dev, VM_NORESERVE);
+	inode = shmem_get_inode(dir->i_sb, dir, mode, dev, VM_NORESERVE, 0);
 	if (inode) {
 		error = security_inode_init_security(inode, dir,
 						     &dentry->d_name,
@@ -2048,8 +2138,10 @@ static int shmem_rename(struct inode *old_dir, struct dentry *old_dentry, struct
 
 	if (new_dentry->d_inode) {
 		(void) shmem_unlink(new_dir, new_dentry);
-		if (they_are_dirs)
+		if (they_are_dirs) {
+			drop_nlink(new_dentry->d_inode);
 			drop_nlink(old_dir);
+		}
 	} else if (they_are_dirs) {
 		drop_nlink(old_dir);
 		inc_nlink(new_dir);
@@ -2076,7 +2168,7 @@ static int shmem_symlink(struct inode *dir, struct dentry *dentry, const char *s
 	if (len > PAGE_CACHE_SIZE)
 		return -ENAMETOOLONG;
 
-	inode = shmem_get_inode(dir->i_sb, dir, S_IFLNK|S_IRWXUGO, 0, VM_NORESERVE);
+	inode = shmem_get_inode(dir->i_sb, dir, S_IFLNK|S_IRWXUGO, 0, VM_NORESERVE, 0);
 	if (!inode)
 		return -ENOSPC;
 
@@ -2618,7 +2710,7 @@ int shmem_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_flags |= MS_POSIXACL;
 #endif
 
-	inode = shmem_get_inode(sb, NULL, S_IFDIR | sbinfo->mode, 0, VM_NORESERVE);
+	inode = shmem_get_inode(sb, NULL, S_IFDIR | sbinfo->mode, 0, VM_NORESERVE, 0);
 	if (!inode)
 		goto failed;
 	inode->i_uid = sbinfo->uid;
@@ -2871,7 +2963,7 @@ EXPORT_SYMBOL_GPL(shmem_truncate_range);
 
 #define shmem_vm_ops				generic_file_vm_ops
 #define shmem_file_operations			ramfs_file_operations
-#define shmem_get_inode(sb, dir, mode, dev, flags)	ramfs_get_inode(sb, dir, mode, dev)
+#define shmem_get_inode(sb, dir, mode, dev, flags, atomic_copy)	ramfs_get_inode(sb, dir, mode, dev)
 #define shmem_acct_size(flags, size)		0
 #define shmem_unacct_size(flags, size)		do {} while (0)
 
@@ -2888,8 +2980,10 @@ static struct dentry_operations anon_ops = {
  * @name: name for dentry (to be seen in /proc/<pid>/maps
  * @size: size to be set for the file
  * @flags: VM_NORESERVE suppresses pre-accounting of the entire object size
+ * @atomic_copy: Atomically copy the area when hibernating?
  */
-struct file *shmem_file_setup(const char *name, loff_t size, unsigned long flags)
+struct file *shmem_file_setup(const char *name, loff_t size, unsigned long flags,
+		int atomic_copy)
 {
 	struct file *res;
 	struct inode *inode;
@@ -2918,7 +3012,7 @@ struct file *shmem_file_setup(const char *name, loff_t size, unsigned long flags
 	path.mnt = mntget(shm_mnt);
 
 	res = ERR_PTR(-ENOSPC);
-	inode = shmem_get_inode(sb, NULL, S_IFREG | S_IRWXUGO, 0, flags);
+	inode = shmem_get_inode(sb, NULL, S_IFREG | S_IRWXUGO, 0, flags, atomic_copy);
 	if (!inode)
 		goto put_dentry;
 
@@ -2961,7 +3055,7 @@ int shmem_zero_setup(struct vm_area_struct *vma)
 	struct file *file;
 	loff_t size = vma->vm_end - vma->vm_start;
 
-	file = shmem_file_setup("dev/zero", size, vma->vm_flags);
+	file = shmem_file_setup("dev/zero", size, vma->vm_flags, 0);
 	if (IS_ERR(file))
 		return PTR_ERR(file);
 
