@@ -71,26 +71,11 @@ static const char longname[] = "Gadget Android";
 #define VENDOR_ID		0x0BB4
 #define PRODUCT_ID		0x0001
 
-#ifdef CONFIG_MTK_KERNEL_POWER_OFF_CHARGING
-#include <mach/mt_boot_common.h>
-#define KPOC_USB_FUNC "mtp"
-#define KPOC_USB_VENDOR_ID 0x0E8D
-#define KPOC_USB_PRODUCT_ID 0x2008
-extern BOOTMODE g_boot_mode;
-#endif
-
 /* f_midi configuration */
 #define MIDI_INPUT_PORTS    1
 #define MIDI_OUTPUT_PORTS   1
 #define MIDI_BUFFER_SIZE    256
 #define MIDI_QUEUE_LENGTH   32
-
-/* Default manufacturer and product string , overridden by userspace */
-#define MANUFACTURER_STRING "MediaTek"
-#define PRODUCT_STRING "MT65xx Android Phone"
-
-
-//#define USB_LOG "USB"
 
 struct android_usb_function {
 	char *name;
@@ -1894,16 +1879,6 @@ static struct android_usb_function *supported_functions[] = {
 	&accessory_function,
 	&audio_source_function,
 	&midi_function,
-#ifdef CONFIG_MTK_C2K_SUPPORT
-	&rawbulk_modem_function,
-	&rawbulk_ets_function,
-	&rawbulk_atc_function,
-	&rawbulk_pcv_function,
-	&rawbulk_gps_function,
-#endif
-#ifdef CONFIG_USB_F_LOOPBACK
-	&loopback_function,
-#endif
 	NULL
 };
 

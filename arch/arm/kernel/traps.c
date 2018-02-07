@@ -34,15 +34,8 @@
 #include <asm/unwind.h>
 #include <asm/tls.h>
 #include <asm/system_misc.h>
-#include <linux/aee.h>
-#include <mach/mt_hooks.h>
-static const char *handler[]= {
-	"prefetch abort",
-	"data abort",
-	"address exception",
-	"interrupt",
-	"undefined instruction",
-};
+
+static const char *handler[]= { "prefetch abort", "data abort", "address exception", "interrupt" };
 
 void *vectors_page;
 
