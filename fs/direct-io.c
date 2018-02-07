@@ -710,11 +710,22 @@ out:
  * If that doesn't work out then we put the old page into the bio and add this
  * page to the dio instead.
  */
+#ifdef CONFIG_MTK_GMO_RAM_OPTIMIZE
+static int
+#else
 static inline int
+#endif
 submit_page_section(struct dio *dio, struct dio_submit *sdio, struct page *page,
 		    unsigned offset, unsigned len, sector_t blocknr,
 		    struct buffer_head *map_bh)
 {
+#ifdef FEATURE_STORAGE_PID_LOGGER
+	struct page_pid_logger *tmp_logger;
+	extern unsigned char *page_logger;
+	extern spinlock_t g_locker;
+	unsigned long page_index;
+	unsigned long flags;
+#endif
 	int ret = 0;
 
 	if (dio->rw & WRITE) {
@@ -722,6 +733,25 @@ submit_page_section(struct dio *dio, struct dio_submit *sdio, struct page *page,
 		 * Read accounting is performed in submit_bio()
 		 */
 		task_io_account_write(len);
+#ifdef FEATURE_STORAGE_PID_LOGGER
+		
+		if( page_logger && page) {
+			//#if defined(CONFIG_FLATMEM)
+			//page_index = (unsigned long)((page) - mem_map) ;
+			//#else
+			page_index = (unsigned long)(__page_to_pfn(page))- PHYS_PFN_OFFSET;
+			//#endif
+			tmp_logger =((struct page_pid_logger *)page_logger) + page_index;
+			spin_lock_irqsave(&g_locker, flags);
+			if( page_index < num_physpages) {
+				if( tmp_logger->pid1 == 0XFFFF)
+					tmp_logger->pid1 = current->pid;
+				else if( tmp_logger->pid1 != current->pid )
+					tmp_logger->pid2 = current->pid;
+			}
+			spin_unlock_irqrestore(&g_locker, flags);
+		}
+#endif
 	}
 
 	/*
@@ -759,7 +789,8 @@ out:
 	 */
 	if (sdio->boundary) {
 		ret = dio_send_cur_page(dio, sdio, map_bh);
-		dio_bio_submit(dio, sdio);
+		if (sdio->bio)
+			dio_bio_submit(dio, sdio);
 		page_cache_release(sdio->cur_page);
 		sdio->cur_page = NULL;
 	}
@@ -933,6 +964,7 @@ do_holes:
 						i_size_aligned >> blkbits) {
 					/* We hit eof */
 					page_cache_release(page);
+					dio_cleanup(dio, sdio);
 					goto out;
 				}
 				zero_user(page, block_in_page << blkbits,

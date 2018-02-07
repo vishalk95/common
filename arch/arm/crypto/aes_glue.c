@@ -49,8 +49,10 @@ static int aes_set_key(struct crypto_tfm *tfm, const u8 *in_key,
 		tfm->crt_flags |= CRYPTO_TFM_RES_BAD_KEY_LEN;
 		return -EINVAL;
 	}
+	#ifndef CONFIG_CRYPTO_AES_ARM32_CE
 	/* private_AES_set_decrypt_key expects an encryption key as input */
 	ctx->dec_key = ctx->enc_key;
+	#endif
 	if (private_AES_set_decrypt_key(in_key, key_len, &ctx->dec_key) == -1) {
 		tfm->crt_flags |= CRYPTO_TFM_RES_BAD_KEY_LEN;
 		return -EINVAL;
@@ -93,6 +95,6 @@ module_exit(aes_fini);
 
 MODULE_DESCRIPTION("Rijndael (AES) Cipher Algorithm (ASM)");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS("aes");
-MODULE_ALIAS("aes-asm");
+MODULE_ALIAS_CRYPTO("aes");
+MODULE_ALIAS_CRYPTO("aes-asm");
 MODULE_AUTHOR("David McCullough <ucdevel@gmail.com>");

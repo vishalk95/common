@@ -38,7 +38,9 @@
 #include <asm/stacktrace.h>
 #include <asm/exception.h>
 #include <asm/system_misc.h>
+#include <asm/cacheflush.h>
 
+#include <mach/mt_hooks.h>
 static const char *handler[]= {
 	"Synchronous Abort",
 	"IRQ",
@@ -95,7 +97,7 @@ static void dump_backtrace_entry(unsigned long where, unsigned long stack)
 	print_ip_sym(where);
 	if (in_exception_text(where))
 		dump_mem("", "Exception stack", stack,
-			 stack + sizeof(struct pt_regs));
+			 stack + sizeof(struct pt_regs) + 180); /* Additional 180 to workaround sp offset */
 }
 
 static void dump_instr(const char *lvl, struct pt_regs *regs)
@@ -189,6 +191,7 @@ void show_stack(struct task_struct *tsk, unsigned long *sp)
 static int __die(const char *str, int err, struct thread_info *thread,
 		 struct pt_regs *regs)
 {
+	unsigned long sp, stack;
 	struct task_struct *tsk = thread->task;
 	static int die_counter;
 	int ret;
@@ -207,8 +210,13 @@ static int __die(const char *str, int err, struct thread_info *thread,
 		 TASK_COMM_LEN, tsk->comm, task_pid_nr(tsk), thread + 1);
 
 	if (!user_mode(regs) || in_interrupt()) {
-		dump_mem(KERN_EMERG, "Stack: ", regs->sp,
-			 THREAD_SIZE + (unsigned long)task_stack_page(tsk));
+		sp = regs->sp;
+		stack = (unsigned long)task_stack_page(tsk);
+		dump_mem(KERN_EMERG, "Stack: ", sp, ALIGN(sp, THREAD_SIZE));
+		if (sp < stack || (sp - stack) > THREAD_SIZE) {
+			printk(KERN_EMERG "Invalid sp[%lx] or stack address[%lx]\n", sp, stack);
+			dump_mem(KERN_EMERG, "Stack(backup) ", stack, THREAD_SIZE + stack);
+		}
 		dump_backtrace(regs, tsk);
 		dump_instr(KERN_EMERG, regs);
 	}
@@ -238,7 +246,8 @@ void die(const char *str, struct pt_regs *regs, int err)
 
 	bust_spinlocks(0);
 	add_taint(TAINT_DIE, LOCKDEP_NOW_UNRELIABLE);
-	raw_spin_unlock_irq(&die_lock);
+	/* keep preemption/irq disabled in KE flow to prevent context switch*/
+	//raw_spin_unlock_irq(&die_lock);
 	oops_exit();
 
 	if (in_interrupt())
@@ -268,7 +277,7 @@ void register_undef_hook(struct undef_hook *hook)
 static int call_undef_hook(struct pt_regs *regs, unsigned int instr)
 {
 	struct undef_hook *hook;
-	int (*fn)(struct pt_regs *regs, unsigned int instr) = NULL;
+	int (*fn)(struct pt_regs *regs, unsigned int instr) = arm_undefinstr_retry;
 
 	list_for_each_entry(hook, &undef_hook, node)
 		if ((instr & hook->instr_mask) == hook->instr_val &&
@@ -283,6 +292,7 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
 	u32 instr;
 	siginfo_t info;
 	void __user *pc = (void __user *)instruction_pointer(regs);
+	struct thread_info *thread = current_thread_info();
 
 	/* check for AArch32 breakpoint instructions */
 	if (!aarch32_break_handler(regs))
@@ -349,17 +359,56 @@ asmlinkage long do_ni_syscall(struct pt_regs *regs)
 	return sys_ni_syscall();
 }
 
+#ifdef CONFIG_MEDIATEK_SOLUTION
+static void (*async_abort_handler)(struct pt_regs *regs, void *);
+static void *async_abort_priv;
+
+int register_async_abort_handler(void (*fn)(struct pt_regs *regs, void *), void *priv)
+{
+	async_abort_handler = fn;
+	async_abort_priv = priv;
+
+	return 0;
+}
+#endif
+
 /*
- * bad_mode handles the impossible case in the exception vector.
+ * bad_mode handles the impossible case in the exception vector. This is always
+ * fatal.
  */
 asmlinkage void bad_mode(struct pt_regs *regs, int reason, unsigned int esr)
+{
+	console_verbose();
+
+#ifdef CONFIG_MEDIATEK_SOLUTION
+	/*
+	 * reason is defined in entry.S, 3 means BAD_ERROR,
+	 * which would be triggered by async abort
+	 */
+	if ((reason == 3) && async_abort_handler) {
+		async_abort_handler(regs, async_abort_priv);
+	}
+#endif
+	pr_crit("Bad mode in %s handler detected, code 0x%08x\n",
+		handler[reason], esr);
+
+	die("Oops - bad mode", regs, 0);
+	local_irq_disable();
+	panic("bad mode");
+}
+
+/*
+ * bad_el0_sync handles unexpected, but potentially recoverable synchronous
+ * exceptions taken from EL0. Unlike bad_mode, this returns.
+ */
+asmlinkage void bad_el0_sync(struct pt_regs *regs, int reason, unsigned int esr)
 {
 	siginfo_t info;
 	void __user *pc = (void __user *)instruction_pointer(regs);
 	console_verbose();
 
-	pr_crit("Bad mode in %s handler detected, code 0x%08x\n",
-		handler[reason], esr);
+	pr_crit("Bad EL0 synchronous exception detected on CPU%d, code 0x%08x\n",
+		smp_processor_id(), esr);
 	__show_regs(regs);
 
 	info.si_signo = SIGILL;
@@ -367,7 +416,7 @@ asmlinkage void bad_mode(struct pt_regs *regs, int reason, unsigned int esr)
 	info.si_code  = ILL_ILLOPC;
 	info.si_addr  = pc;
 
-	arm64_notify_die("Oops - bad mode", regs, &info, 0);
+	force_sig_info(info.si_signo, &info, current);
 }
 
 void __pte_error(const char *file, int line, unsigned long val)

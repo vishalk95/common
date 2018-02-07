@@ -36,9 +36,10 @@ static void *seq_buf_alloc(unsigned long size)
 {
 	void *buf;
 
-	buf = kmalloc(size, GFP_KERNEL | __GFP_NOWARN);
-	if (!buf && size > PAGE_SIZE)
+	if (size > PAGE_SIZE)
 		buf = vmalloc(size);
+	else
+		buf = kmalloc(size, GFP_KERNEL | __GFP_NOWARN);
 	return buf;
 }
 
@@ -218,8 +219,10 @@ ssize_t seq_read(struct file *file, char __user *buf, size_t size, loff_t *ppos)
 		size -= n;
 		buf += n;
 		copied += n;
-		if (!m->count)
+		if (!m->count) {
+			m->from = 0;
 			m->index++;
+		}
 		if (!size)
 			goto Done;
 	}

@@ -38,8 +38,8 @@ ext4_group_t ext4_get_group_number(struct super_block *sb,
 	ext4_group_t group;
 
 	if (test_opt2(sb, STD_GROUP_SIZE))
-		group = (le32_to_cpu(EXT4_SB(sb)->s_es->s_first_data_block) +
-			 block) >>
+		group = (block -
+			 le32_to_cpu(EXT4_SB(sb)->s_es->s_first_data_block)) >>
 			(EXT4_BLOCK_SIZE_BITS(sb) + EXT4_CLUSTER_BITS(sb) + 3);
 	else
 		ext4_get_group_no_and_offset(sb, block, &group, NULL);
@@ -526,7 +526,7 @@ static int ext4_has_free_clusters(struct ext4_sb_info *sbi,
 		return 1;
 
 	/* Hm, nope.  Are (enough) root reserved clusters available? */
-	if (uid_eq(sbi->s_resuid, current_fsuid()) ||
+	if (uid_gte(sbi->s_resuid, current_fsuid()) ||
 	    (!gid_eq(sbi->s_resgid, GLOBAL_ROOT_GID) && in_group_p(sbi->s_resgid)) ||
 	    capable(CAP_SYS_RESOURCE) ||
 	    (flags & EXT4_MB_USE_ROOT_BLOCKS)) {

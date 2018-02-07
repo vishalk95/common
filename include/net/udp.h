@@ -104,6 +104,8 @@ static inline struct udp_hslot *udp_hashslot2(struct udp_table *table,
 /* Default, as per the RFC, is to always do csums. */
 #define UDP_CSUM_DEFAULT	0
 
+#define UDP_SKT_WIFI
+
 extern struct proto udp_prot;
 
 extern atomic_long_t udp_memory_allocated;
@@ -112,6 +114,13 @@ extern atomic_long_t udp_memory_allocated;
 extern long sysctl_udp_mem[3];
 extern int sysctl_udp_rmem_min;
 extern int sysctl_udp_wmem_min;
+
+#ifdef UDP_SKT_WIFI
+extern int sysctl_met_is_enable;
+extern int sysctl_udp_met_port;
+extern void udp_event_trace_printk(const char * fmt, int pid, __u16 port);
+#define MET_SOCKET_LATENCY_NAME "SKT-WIFI"
+#endif
 
 struct sk_buff;
 
@@ -181,6 +190,7 @@ extern int udp_get_port(struct sock *sk, unsigned short snum,
 extern void udp_err(struct sk_buff *, u32);
 extern int udp_sendmsg(struct kiocb *iocb, struct sock *sk,
 			    struct msghdr *msg, size_t len);
+extern int udp_push_pending_frames(struct sock *sk);
 extern void udp_flush_pending_frames(struct sock *sk);
 extern int udp_rcv(struct sk_buff *skb);
 extern int udp_ioctl(struct sock *sk, int cmd, unsigned long arg);
