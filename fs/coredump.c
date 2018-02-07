@@ -1,6 +1,7 @@
 #include <linux/slab.h>
 #include <linux/file.h>
 #include <linux/fdtable.h>
+#include <linux/freezer.h>
 #include <linux/mm.h>
 #include <linux/stat.h>
 #include <linux/fcntl.h>
@@ -299,7 +300,7 @@ static int zap_threads(struct task_struct *tsk, struct mm_struct *mm,
 	if (unlikely(nr < 0))
 		return nr;
 
-	tsk->flags = PF_DUMPCORE;
+	tsk->flags |= PF_DUMPCORE;
 	if (atomic_read(&mm->mm_users) == nr + 1)
 		goto done;
 	/*
@@ -375,7 +376,9 @@ static int coredump_wait(int exit_code, struct core_state *core_state)
 	if (core_waiters > 0) {
 		struct core_thread *ptr;
 
+		freezer_do_not_count();
 		wait_for_completion(&core_state->startup);
+		freezer_count();
 		/*
 		 * Wait for all the threads to become inactive, so that
 		 * all the thread context (extended register state, like
@@ -491,10 +494,10 @@ void do_coredump(siginfo_t *siginfo)
 	const struct cred *old_cred;
 	struct cred *cred;
 	int retval = 0;
-	int flag = 0;
 	int ispipe;
 	struct files_struct *displaced;
-	bool need_nonrelative = false;
+	/* require nonrelative corefile path and be extra careful */
+	bool need_suid_safe = false;
 	bool core_dumped = false;
 	static atomic_t core_dump_count = ATOMIC_INIT(0);
 	struct coredump_params cprm = {
@@ -512,14 +515,23 @@ void do_coredump(siginfo_t *siginfo)
 	audit_core_dumps(siginfo->si_signo);
 
 	binfmt = mm->binfmt;
-	if (!binfmt || !binfmt->core_dump)
+	if (!binfmt || !binfmt->core_dump) {
+		printk(KERN_WARNING "Skip process %d(%s) core dump(!binfmt?%s)\n",
+			task_tgid_vnr(current), current->comm, (!binfmt) ? "yes":"no");
 		goto fail;
-	if (!__get_dumpable(cprm.mm_flags))
+	}
+	if (!__get_dumpable(cprm.mm_flags)) {
+		printk(KERN_WARNING "Skip process %d(%s) core dump(mm_flags:%x)\n",
+			task_tgid_vnr(current), current->comm, (unsigned int)cprm.mm_flags);
 		goto fail;
+	}
 
 	cred = prepare_creds();
-	if (!cred)
+	if (!cred) {
+		printk(KERN_WARNING "Skip process %d(%s) core dump(prepare_creds failed)\n",
+			task_tgid_vnr(current), current->comm);
 		goto fail;
+	}
 	/*
 	 * We cannot trust fsuid as being the "true" uid of the process
 	 * nor do we know its entire history. We only know it was tainted
@@ -528,9 +540,8 @@ void do_coredump(siginfo_t *siginfo)
 	 */
 	if (__get_dumpable(cprm.mm_flags) == SUID_DUMP_ROOT) {
 		/* Setuid core dump mode */
-		flag = O_EXCL;		/* Stop rewrite attacks */
 		cred->fsuid = GLOBAL_ROOT_UID;	/* Dump root private */
-		need_nonrelative = true;
+		need_suid_safe = true;
 	}
 
 	retval = coredump_wait(siginfo->si_signo, &core_state);
@@ -611,7 +622,7 @@ void do_coredump(siginfo_t *siginfo)
 		if (cprm.limit < binfmt->min_coredump)
 			goto fail_unlock;
 
-		if (need_nonrelative && cn.corename[0] != '/') {
+		if (need_suid_safe && cn.corename[0] != '/') {
 			printk(KERN_WARNING "Pid %d(%s) can only dump core "\
 				"to fully qualified path!\n",
 				task_tgid_vnr(current), current->comm);
@@ -619,8 +630,35 @@ void do_coredump(siginfo_t *siginfo)
 			goto fail_unlock;
 		}
 
+		/*
+		 * Unlink the file if it exists unless this is a SUID
+		 * binary - in that case, we're running around with root
+		 * privs and don't want to unlink another user's coredump.
+		 */
+		if (!need_suid_safe) {
+			mm_segment_t old_fs;
+
+			old_fs = get_fs();
+			set_fs(KERNEL_DS);
+			/*
+			 * If it doesn't exist, that's fine. If there's some
+			 * other problem, we'll catch it at the filp_open().
+			 */
+			(void) sys_unlink((const char __user *)cn.corename);
+			set_fs(old_fs);
+		}
+
+		/*
+		 * There is a race between unlinking and creating the
+		 * file, but if that causes an EEXIST here, that's
+		 * fine - another process raced with us while creating
+		 * the corefile, and the other process won. To userspace,
+		 * what matters is that at least one of the two processes
+		 * writes its coredump successfully, not which one.
+		 */
 		cprm.file = filp_open(cn.corename,
-				 O_CREAT | 2 | O_NOFOLLOW | O_LARGEFILE | flag,
+				 O_CREAT | 2 | O_NOFOLLOW |
+				 O_LARGEFILE | O_EXCL,
 				 0600);
 		if (IS_ERR(cprm.file))
 			goto fail_unlock;
@@ -656,9 +694,12 @@ void do_coredump(siginfo_t *siginfo)
 		put_files_struct(displaced);
 	if (!dump_interrupted()) {
 		file_start_write(cprm.file);
+		printk(KERN_WARNING "before %d core dump\n", current->pid);
 		core_dumped = binfmt->core_dump(&cprm);
 		file_end_write(cprm.file);
 	}
+	else
+		printk(KERN_WARNING "before %d core dump interrupted error\n", current->pid);
 	if (ispipe && core_pipe_limit)
 		wait_for_dump_helpers(cprm.file);
 close_fail:
@@ -685,9 +726,26 @@ fail:
  */
 int dump_write(struct file *file, const void *addr, int nr)
 {
-	return !dump_interrupted() &&
-		access_ok(VERIFY_READ, addr, nr) &&
-		file->f_op->write(file, addr, nr, &file->f_pos) == nr;
+	if (!dump_interrupted()) {
+		if (access_ok(VERIFY_READ, addr, nr)) {
+			int pipe_ret = file->f_op->write(file, addr, nr, &file->f_pos);
+			if (pipe_ret == nr) {
+				return 1;
+			}
+			if (pipe_ret == -ERESTARTSYS) {
+			}
+			else {
+				printk(KERN_WARNING "coredump(%d): pipe dump write error nr:%d, ret:%d\n", current->pid, nr, pipe_ret);
+			}
+		}
+		else {
+			printk(KERN_WARNING "coredump(%d): access verify error\n", current->pid);
+		}
+	}
+	else {
+		printk(KERN_WARNING "coredump(%d): interrupted error\n", current->pid);
+	}
+	return 0;
 }
 EXPORT_SYMBOL(dump_write);
 

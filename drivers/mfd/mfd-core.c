@@ -10,7 +10,6 @@
  * published by the Free Software Foundation.
  *
  */
-
 #include <linux/kernel.h>
 #include <linux/platform_device.h>
 #include <linux/acpi.h>
@@ -262,6 +261,8 @@ int mfd_clone_cell(const char *cell, const char **clones, size_t n_clones)
 			dev_err(dev, "failed to create platform device '%s'\n",
 					clones[i]);
 	}
+
+	put_device(dev);
 
 	return 0;
 }

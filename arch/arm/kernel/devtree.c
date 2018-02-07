@@ -26,6 +26,8 @@
 #include <asm/mach/arch.h>
 #include <asm/mach-types.h>
 
+extern char default_command_line[COMMAND_LINE_SIZE];
+
 void __init early_init_dt_add_memory_arch(u64 base, u64 size)
 {
 	arm_add_memory(base, size);
@@ -90,6 +92,8 @@ void __init arm_dt_init_cpu_maps(void)
 		return;
 
 	for_each_child_of_node(cpus, cpu) {
+		const __be32 *cell;
+		int prop_bytes;
 		u32 hwid;
 
 		if (of_node_cmp(cpu->type, "cpu"))
@@ -101,17 +105,23 @@ void __init arm_dt_init_cpu_maps(void)
 		 * properties is considered invalid to build the
 		 * cpu_logical_map.
 		 */
-		if (of_property_read_u32(cpu, "reg", &hwid)) {
+		cell = of_get_property(cpu, "reg", &prop_bytes);
+		if (!cell || prop_bytes < sizeof(*cell)) {
 			pr_debug(" * %s missing reg property\n",
 				     cpu->full_name);
 			return;
 		}
 
 		/*
-		 * 8 MSBs must be set to 0 in the DT since the reg property
+		 * Bits n:24 must be set to 0 in the DT since the reg property
 		 * defines the MPIDR[23:0].
 		 */
-		if (hwid & ~MPIDR_HWID_BITMASK)
+		do {
+			hwid = be32_to_cpu(*cell++);
+			prop_bytes -= sizeof(*cell);
+		} while (!hwid && prop_bytes > 0);
+
+		if (prop_bytes || (hwid & ~MPIDR_HWID_BITMASK))
 			return;
 
 		/*
@@ -183,6 +193,7 @@ struct machine_desc * __init setup_machine_fdt(unsigned int dt_phys)
 	unsigned int score, mdesc_score = ~1;
 	unsigned long dt_root;
 	const char *model;
+	char *from = default_command_line;
 
 #ifdef CONFIG_ARCH_MULTIPLATFORM
 	DT_MACHINE_START(GENERIC_DT, "Generic DT based system")
@@ -244,6 +255,11 @@ struct machine_desc * __init setup_machine_fdt(unsigned int dt_phys)
 
 	/* Change machine number to match the mdesc we're using */
 	__machine_arch_type = mdesc_best->nr;
+
+	if (mdesc_best->fixup) {
+        mdesc_best->fixup((void *)dt_root, &from, &meminfo);
+        strlcpy(boot_command_line, from, COMMAND_LINE_SIZE);
+    }
 
 	return mdesc_best;
 }

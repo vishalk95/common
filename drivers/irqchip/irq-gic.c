@@ -42,6 +42,7 @@
 #include <linux/irqchip/chained_irq.h>
 #include <linux/irqchip/arm-gic.h>
 
+#include <asm/cputype.h>
 #include <asm/irq.h>
 #include <asm/exception.h>
 #include <asm/smp_plat.h>
@@ -227,6 +228,7 @@ static int gic_set_type(struct irq_data *d, unsigned int type)
 	if (enabled)
 		writel_relaxed(enablemask, base + GIC_DIST_ENABLE_SET + enableoff);
 
+
 	raw_spin_unlock(&irq_controller_lock);
 
 	return 0;
@@ -246,9 +248,13 @@ static int gic_set_affinity(struct irq_data *d, const struct cpumask *mask_val,
 			    bool force)
 {
 	void __iomem *reg = gic_dist_base(d) + GIC_DIST_TARGET + (gic_irq(d) & ~3);
-	unsigned int shift = (gic_irq(d) % 4) * 8;
-	unsigned int cpu = cpumask_any_and(mask_val, cpu_online_mask);
+	unsigned int cpu, shift = (gic_irq(d) % 4) * 8;
 	u32 val, mask, bit;
+
+	if (!force)
+		cpu = cpumask_any_and(mask_val, cpu_online_mask);
+	else
+		cpu = cpumask_first(mask_val);
 
 	if (cpu >= NR_GIC_CPU_IF || cpu >= nr_cpu_ids)
 		return -EINVAL;
@@ -355,6 +361,7 @@ void __init gic_cascade_irq(unsigned int gic_nr, unsigned int irq)
 	irq_set_chained_handler(irq, gic_handle_cascade_irq);
 }
 
+/*
 static u8 gic_get_cpumask(struct gic_chip_data *gic)
 {
 	void __iomem *base = gic_data_dist_base(gic);
@@ -373,6 +380,7 @@ static u8 gic_get_cpumask(struct gic_chip_data *gic)
 
 	return mask;
 }
+*/
 
 static void __init gic_dist_init(struct gic_chip_data *gic)
 {
@@ -392,7 +400,9 @@ static void __init gic_dist_init(struct gic_chip_data *gic)
 	/*
 	 * Set all global interrupts to this CPU only.
 	 */
-	cpumask = gic_get_cpumask(gic);
+	//cpumask = gic_get_cpumask(gic);
+	/*FIXME*/
+	cpumask = 1 << smp_processor_id();
 	cpumask |= cpumask << 8;
 	cpumask |= cpumask << 16;
 	for (i = 32; i < gic_irqs; i += 4)
@@ -425,7 +435,9 @@ static void __cpuinit gic_cpu_init(struct gic_chip_data *gic)
 	 * Get what the GIC says our CPU mask is.
 	 */
 	BUG_ON(cpu >= NR_GIC_CPU_IF);
-	cpu_mask = gic_get_cpumask(gic);
+	//cpu_mask = gic_get_cpumask(gic);
+	//FIXME
+	cpu_mask = 1 << smp_processor_id();
 	gic_cpu_map[cpu] = cpu_mask;
 
 	/*
@@ -701,6 +713,17 @@ static int gic_irq_domain_xlate(struct irq_domain *d,
 	return 0;
 }
 
+void gic_register_sgi(unsigned int gic_nr, int irq)
+{
+	struct irq_desc *desc = irq_to_desc(irq);
+	if (desc)
+		desc->irq_data.hwirq = irq;
+	irq_set_chip_and_handler(irq, &gic_chip,
+				 handle_fasteoi_irq);
+	set_irq_flags(irq, IRQF_VALID | IRQF_PROBE);
+	irq_set_chip_data(irq, &gic_data[gic_nr]);
+}
+
 #ifdef CONFIG_SMP
 static int __cpuinit gic_secondary_init(struct notifier_block *nfb,
 					unsigned long action, void *hcpu)
@@ -750,7 +773,9 @@ void __init gic_init_bases(unsigned int gic_nr, int irq_start,
 		}
 
 		for_each_possible_cpu(cpu) {
-			unsigned long offset = percpu_offset * cpu_logical_map(cpu);
+			u32 mpidr = cpu_logical_map(cpu);
+			u32 core_id = MPIDR_AFFINITY_LEVEL(mpidr, 0);
+			unsigned long offset = percpu_offset * core_id;
 			*per_cpu_ptr(gic->dist_base.percpu_base, cpu) = dist_base + offset;
 			*per_cpu_ptr(gic->cpu_base.percpu_base, cpu) = cpu_base + offset;
 		}
@@ -827,7 +852,7 @@ static int gic_cnt __initdata;
 int __init gic_of_init(struct device_node *node, struct device_node *parent)
 {
 	void __iomem *cpu_base;
-	void __iomem *dist_base;
+	void __iomem *dist_base; 
 	u32 percpu_offset;
 	int irq;
 
@@ -838,7 +863,7 @@ int __init gic_of_init(struct device_node *node, struct device_node *parent)
 	WARN(!dist_base, "unable to map gic dist registers\n");
 
 	cpu_base = of_iomap(node, 1);
-	WARN(!cpu_base, "unable to map gic cpu registers\n");
+	WARN(!cpu_base, "unable to map gic cpu registers\n"); 
 
 	if (of_property_read_u32(node, "cpu-offset", &percpu_offset))
 		percpu_offset = 0;
@@ -854,6 +879,7 @@ int __init gic_of_init(struct device_node *node, struct device_node *parent)
 }
 IRQCHIP_DECLARE(cortex_a15_gic, "arm,cortex-a15-gic", gic_of_init);
 IRQCHIP_DECLARE(cortex_a9_gic, "arm,cortex-a9-gic", gic_of_init);
+IRQCHIP_DECLARE(cortex_a7_gic, "arm,cortex-a7-gic", gic_of_init);
 IRQCHIP_DECLARE(msm_8660_qgic, "qcom,msm-8660-qgic", gic_of_init);
 IRQCHIP_DECLARE(msm_qgic2, "qcom,msm-qgic2", gic_of_init);
 

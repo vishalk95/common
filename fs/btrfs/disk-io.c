@@ -1677,6 +1677,8 @@ static int cleaner_kthread(void *arg)
 {
 	struct btrfs_root *root = arg;
 
+	set_freezable();
+
 	do {
 		int again = 0;
 
@@ -1693,11 +1695,11 @@ static int cleaner_kthread(void *arg)
 
 		if (!try_to_freeze() && !again) {
 			set_current_state(TASK_INTERRUPTIBLE);
-			if (!kthread_should_stop())
+			if (!kthread_freezable_should_stop(NULL))
 				schedule();
 			__set_current_state(TASK_RUNNING);
 		}
-	} while (!kthread_should_stop());
+	} while (!kthread_freezable_should_stop(NULL));
 	return 0;
 }
 
@@ -1710,6 +1712,8 @@ static int transaction_kthread(void *arg)
 	unsigned long now;
 	unsigned long delay;
 	bool cannot_commit;
+
+	set_freezable();
 
 	do {
 		cannot_commit = false;
@@ -1751,13 +1755,13 @@ sleep:
 
 		if (!try_to_freeze()) {
 			set_current_state(TASK_INTERRUPTIBLE);
-			if (!kthread_should_stop() &&
+			if (!kthread_freezable_should_stop(NULL) &&
 			    (!btrfs_transaction_blocked(root->fs_info) ||
 			     cannot_commit))
 				schedule_timeout(delay);
 			__set_current_state(TASK_RUNNING);
 		}
-	} while (!kthread_should_stop());
+	} while (!kthread_freezable_should_stop(NULL));
 	return 0;
 }
 
@@ -2437,6 +2441,7 @@ int open_ctree(struct super_block *sb,
 		       "unsupported option features (%Lx).\n",
 		       (unsigned long long)features);
 		err = -EINVAL;
+		brelse(bh);
 		goto fail_alloc;
 	}
 
@@ -3161,6 +3166,8 @@ static int barrier_all_devices(struct btrfs_fs_info *info)
 	/* send down all the barriers */
 	head = &info->fs_devices->devices;
 	list_for_each_entry_rcu(dev, head, dev_list) {
+		if (dev->missing)
+			continue;
 		if (!dev->bdev) {
 			errors_send++;
 			continue;
@@ -3175,6 +3182,8 @@ static int barrier_all_devices(struct btrfs_fs_info *info)
 
 	/* wait for all the barriers */
 	list_for_each_entry_rcu(dev, head, dev_list) {
+		if (dev->missing)
+			continue;
 		if (!dev->bdev) {
 			errors_wait++;
 			continue;
@@ -3514,6 +3523,11 @@ int close_ctree(struct btrfs_root *root)
 
 	btrfs_free_block_groups(fs_info);
 
+	/*
+	 * we must make sure there is not any read request to
+	 * submit after we stopping all workers.
+	 */
+	invalidate_inode_pages2(fs_info->btree_inode->i_mapping);
 	btrfs_stop_all_workers(fs_info);
 
 	del_fs_roots(fs_info);
@@ -3847,12 +3861,6 @@ again:
 					    EXTENT_DIRTY, NULL);
 		if (ret)
 			break;
-
-		/* opt_discard */
-		if (btrfs_test_opt(root, DISCARD))
-			ret = btrfs_error_discard_extent(root, start,
-							 end + 1 - start,
-							 NULL);
 
 		clear_extent_dirty(unpin, start, end, GFP_NOFS);
 		btrfs_error_unpin_extent_range(root, start, end);

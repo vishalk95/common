@@ -206,6 +206,7 @@ int i2c_generic_scl_recovery(struct i2c_adapter *adap)
 	adap->bus_recovery_info->set_scl(adap, 1);
 	return i2c_generic_recovery(adap);
 }
+EXPORT_SYMBOL_GPL(i2c_generic_scl_recovery);
 
 int i2c_generic_gpio_recovery(struct i2c_adapter *adap)
 {
@@ -220,6 +221,7 @@ int i2c_generic_gpio_recovery(struct i2c_adapter *adap)
 
 	return ret;
 }
+EXPORT_SYMBOL_GPL(i2c_generic_gpio_recovery);
 
 int i2c_recover_bus(struct i2c_adapter *adap)
 {
@@ -229,6 +231,7 @@ int i2c_recover_bus(struct i2c_adapter *adap)
 	dev_dbg(&adap->dev, "Trying i2c bus recovery\n");
 	return adap->bus_recovery_info->recover_bus(adap);
 }
+EXPORT_SYMBOL_GPL(i2c_recover_bus);
 
 static int i2c_device_probe(struct device *dev)
 {
@@ -1320,6 +1323,7 @@ int i2c_register_driver(struct module *owner, struct i2c_driver *driver)
 	/* add the driver to the list of i2c drivers in the driver core */
 	driver->driver.owner = owner;
 	driver->driver.bus = &i2c_bus_type;
+	INIT_LIST_HEAD(&driver->clients);
 
 	/* When registration returns, the driver core
 	 * will have called probe() for all matching-but-unbound devices.
@@ -1338,7 +1342,6 @@ int i2c_register_driver(struct module *owner, struct i2c_driver *driver)
 
 	pr_debug("i2c-core: driver [%s] registered\n", driver->driver.name);
 
-	INIT_LIST_HEAD(&driver->clients);
 	/* Walk the adapters that are already present */
 	i2c_for_each_dev(driver, __process_new_driver);
 
@@ -1586,7 +1589,10 @@ int i2c_master_send(const struct i2c_client *client, const char *buf, int count)
 	msg.flags = client->flags & I2C_M_TEN;
 	msg.len = count;
 	msg.buf = (char *)buf;
-
+	#ifdef USE_I2C_MTK_EXT
+	msg.timing = client->timing;
+	msg.ext_flag = client->ext_flag;
+	#endif
 	ret = i2c_transfer(adap, &msg, 1);
 
 	/*
@@ -1616,7 +1622,10 @@ int i2c_master_recv(const struct i2c_client *client, char *buf, int count)
 	msg.flags |= I2C_M_RD;
 	msg.len = count;
 	msg.buf = buf;
-
+	#ifdef USE_I2C_MTK_EXT
+	msg.timing = client->timing;
+	msg.ext_flag = client->ext_flag;
+	#endif
 	ret = i2c_transfer(adap, &msg, 1);
 
 	/*
@@ -1627,6 +1636,73 @@ int i2c_master_recv(const struct i2c_client *client, char *buf, int count)
 }
 EXPORT_SYMBOL(i2c_master_recv);
 
+#ifdef USE_I2C_MTK_EXT
+
+/**
+ * mt_i2c_master_send - issue a single I2C message in master transmit mode
+ * @client: Handle to slave device
+ * @buf: Data that will be written to the slave
+ * @count: How many bytes to write, must be less than 64k since msg.len is u16
+ * @ext_flag: Controller special flags, for example, if you want using DMA, ext_flag |= I2C_DMA_FLAG.
+ * 			is the same to client->ext_flag 
+ *
+ * Returns negative errno, or else the number of bytes written.
+ */
+int mt_i2c_master_send(const struct i2c_client *client, const char *buf, int count, u32 ext_flag)
+{
+	int ret;
+	struct i2c_adapter *adap = client->adapter;
+	struct i2c_msg msg;
+
+	msg.addr = client->addr;
+	msg.flags = client->flags & I2C_M_TEN;
+	msg.timing = client->timing;
+	msg.len = count;
+	msg.buf = (char *)buf;
+	msg.ext_flag = ext_flag;
+	ret = i2c_transfer(adap, &msg, 1);
+
+	/*
+	 * If everything went ok (i.e. 1 msg transmitted), return #bytes
+	 * transmitted, else error code.
+	 */
+	return (ret == 1) ? count : ret;
+}
+EXPORT_SYMBOL(mt_i2c_master_send);
+
+/**
+ * i2c_master_recv - issue a single I2C message in master receive mode
+ * @client: Handle to slave device
+ * @buf: Where to store data read from slave
+ * @count: How many bytes to read, must be less than 64k since msg.len is u16
+ * @ext_flag: Controller special flags, for example, if you want using DMA, ext_flag |= I2C_DMA_FLAG.
+ * 			is the same to client->ext_flag 
+ *
+ * Returns negative errno, or else the number of bytes read.
+ */
+int mt_i2c_master_recv(const struct i2c_client *client, char *buf, int count, u32 ext_flag)
+{
+	struct i2c_adapter *adap = client->adapter;
+	struct i2c_msg msg;
+	int ret;
+
+	msg.addr = client->addr;
+	msg.flags = client->flags & I2C_M_TEN;
+	msg.flags |= I2C_M_RD;
+	msg.timing = client->timing;
+	msg.len = count;
+	msg.buf = buf;
+	msg.ext_flag = ext_flag;
+	ret = i2c_transfer(adap, &msg, 1);
+
+	/*
+	 * If everything went ok (i.e. 1 msg received), return #bytes received,
+	 * else error code.
+	 */
+	return (ret == 1) ? count : ret;
+}
+EXPORT_SYMBOL(mt_i2c_master_recv);
+#endif
 /* ----------------------------------------------------
  * the i2c address scanning function
  * Will not work for 10-bit addresses!
